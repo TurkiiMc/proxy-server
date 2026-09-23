@@ -156,7 +156,7 @@ async def yahoo_candles(symbol: str = Query(...), period: str = Query("6mo")):
     return payload
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD", "POST"])
 async def health():
     """فحص عميق: يجلب AAPL فعلاً — يكشف الحجب وليس فقط نوم الحاوية"""
     try:
