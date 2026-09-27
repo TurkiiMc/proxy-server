@@ -1,162 +1,67 @@
-import httpx
-import asyncio
-import time
-import random
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timezone
+from fastapi import FastAPI
+import requests
 
-app = FastAPI(title="Yahoo Crumb Proxy", version="2.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
-
-_client = None
-_crumb = None
-_crumb_lock = asyncio.Lock()
-_cache = {}
-CACHE_TTL = 60
-
-
-def _new_client():
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=10.0),
-        follow_redirects=True,
-        headers={
-            "User-Agent": random.choice(UAS),
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-
-
-async def _get_client():
-    global _client
-    if _client is None or _client.is_closed:
-        _client = _new_client()
-    return _client
-
-
-async def _refresh_crumb(force=False):
-    global _crumb
-    async with _crumb_lock:
-        if _crumb is not None and not force:
-            return _crumb
-        c = await _get_client()
-        try:
-            await c.get("https://fc.yahoo.com")
-            r = await c.get("https://query2.finance.yahoo.com/v1/test/getcrumb")
-            _crumb = r.text.strip() if (r.status_code == 200 and r.text.strip()) else None
-        except Exception:
-            _crumb = None
-        return _crumb
-
-
-async def _burn_session():
-    global _client, _crumb
-    _crumb = None
-    if _client is not None and not _client.is_closed:
-        try:
-            await _client.aclose()
-        except Exception:
-            pass
-        _client = None
-
-
-async def _fetch_chart(symbol, period, interval="1d"):
-    last_err = None
-    for attempt in range(4):
-        c = await _get_client()
-        crumb = await _refresh_crumb()
-        host = "query2" if attempt % 2 == 0 else "query1"
-        params = {"range": period, "interval": interval, "includePrePost": "false"}
-        if interval == "1d":
-            params["events"] = "splits,div"
-        if crumb:
-            params["crumb"] = crumb
-        try:
-            r = await c.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}",
-                            params=params)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (401, 403, 429, 999):
-                await _burn_session()
-                last_err = r.status_code
-                await asyncio.sleep(1.5 + attempt * 2)
-                continue
-            last_err = r.status_code
-        except Exception as e:
-            last_err = repr(e)
-            await asyncio.sleep(1 + attempt)
-    raise HTTPException(502, detail=f"Yahoo blocked/unreachable: {last_err}")
-
-
-def _parse(data, symbol, interval="1d"):
-    result = data.get("chart", {}).get("result", [])
-    if not result:
-        raise HTTPException(404, "No data")
-    chart = result[0]
-    ts = chart.get("timestamp", [])
-    q = chart["indicators"]["quote"][0]
-    fmt = "%Y-%m-%d" if interval == "1d" else "%Y-%m-%d %H:%M"
-    candles = []
-    for i, t in enumerate(ts):
-        if i < len(q["close"]) and q["close"][i] is not None:
-            candles.append({
-                "date": datetime.fromtimestamp(t, tz=timezone.utc).strftime(fmt),
-                "open": q["open"][i],
-                "high": q["high"][i],
-                "low": q["low"][i],
-                "close": q["close"][i],
-                "volume": q["volume"][i] or 0,
-            })
-    splits = []
-    for ts_key, sp in (chart.get("events", {}).get("splits", {}) or {}).items():
-        splits.append({
-            "date": datetime.fromtimestamp(int(ts_key), tz=timezone.utc).strftime("%Y-%m-%d"),
-            "numerator": sp.get("numerator", 1),
-            "denominator": sp.get("denominator", 1),
-            "ratio": sp.get("splitRatio", ""),
-        })
-    return {"success": True, "symbol": symbol, "count": len(candles),
-            "candles": candles, "splits": splits}
-
+app = FastAPI()
 
 @app.get("/")
-async def root():
-    return {"message": "Proxy working", "version": "2.1", "crumb_ready": _crumb is not None}
+def root():
+    return {"service": "faisal-proxy", "status": "alive"}
 
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.get("/yahoo/candles")
-async def yahoo_candles(symbol: str = Query(...), period: str = Query("6mo"),
-                        interval: str = Query("1d")):
-    sym = symbol.upper()
-    key = (sym, period, interval)
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and (now - hit[0]) < CACHE_TTL:
-        return hit[1]
-    data = await _fetch_chart(sym, period, interval)
-    payload = _parse(data, sym, interval)
-    _cache[key] = (now, payload)
-    return payload
-
-
-@app.api_route("/health", methods=["GET", "HEAD", "POST"])
-async def health():
+def yahoo_candles(symbol: str, period: str = "6mo", interval: str = "1d"):
     try:
-        data = await _fetch_chart("AAPL", "1mo")
-        ok = bool(data.get("chart", {}).get("result"))
-        if ok:
-            return {"status": "ok", "yahoo": True, "cache_entries": len(_cache)}
-        return JSONResponse({"status": "degraded", "yahoo": False,
-                             "cache_entries": len(_cache)}, status_code=200)
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                         params={"range": period, "interval": interval},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        if r.status_code != 200:
+            return {"success": False, "error": f"HTTP {r.status_code}"}
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return {"success": False, "error": "no result"}
+        res = result[0]
+        ts = res.get("timestamp", [])
+        q = res.get("indicators", {}).get("quote", [{}])[0]
+        candles = []
+        for i, t in enumerate(ts):
+            o = (q.get("open") or [None]*len(ts))[i]
+            h = (q.get("high") or [None]*len(ts))[i]
+            l = (q.get("low") or [None]*len(ts))[i]
+            c = (q.get("close") or [None]*len(ts))[i]
+            v = (q.get("volume") or [None]*len(ts))[i]
+            if None in (o, h, l, c): continue
+            candles.append({"date": t, "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
+        splits = []
+        ev = res.get("events", {}).get("splits")
+        if ev:
+            for s in ev:
+                splits.append({"date": s.get("date"), "numerator": s.get("numerator", 1),
+                               "denominator": s.get("denominator", 1)})
+        return {"success": True, "candles": candles, "splits": splits}
     except Exception as e:
-        return JSONResponse({"status": "down", "yahoo": False, "error": str(e)},
-                            status_code=503)
+        return {"success": False, "error": str(e)}
+
+@app.get("/yahoo/last")
+def yahoo_last(symbols: str = ""):
+    """اقتباسات مجمّعة لآخر سعر وحجم (لـ discovery pool)"""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:200]
+    out = {}
+    def one(s):
+        try:
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s}",
+                             params={"range": "5d", "interval": "1d"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if r.status_code != 200: return
+            meta = r.json()["chart"]["result"][0]["meta"]
+            p = meta.get("regularMarketPrice") or 0
+            v = meta.get("regularMarketVolume") or 0
+            if p: out[s] = {"price": p, "volume": v}
+        except Exception: pass
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        list(ex.map(one, syms))
+    return {"ok": True, "quotes": out}
