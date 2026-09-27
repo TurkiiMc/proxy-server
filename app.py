@@ -1,67 +1,243 @@
-from fastapi import FastAPI
+"""
+Faisal Proxy Server - Yahoo Finance API Proxy
+يوفر نقاط وصول للشموع والاقتباسات من Yahoo Finance
+"""
+import os
+import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, Query
+from fastapi.responses import PlainTextResponse
 
-app = FastAPI()
+app = FastAPI(title="Faisal Proxy Server", version="1.0.0")
 
-@app.get("/")
+# ===== نقاط الفحص والإيقاظ =====
+
+@app.get("/", response_class=PlainTextResponse)
 def root():
-    return {"service": "faisal-proxy", "status": "alive"}
+    """نقطة جذرية خفيفة لإيقاظ الخدمة"""
+    return "Faisal Proxy Server - Online"
+
+@app.get("/ping", response_class=PlainTextResponse)
+def ping():
+    """نقطة خفيفة لـ cron-job.org"""
+    return "pong"
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    """نقطة فحص لـ UptimeRobot و Render"""
+    return {"ok": True, "service": "faisal-proxy", "timestamp": int(time.time())}
+
+# ===== Yahoo Finance Chart API =====
 
 @app.get("/yahoo/candles")
-def yahoo_candles(symbol: str, period: str = "6mo", interval: str = "1d"):
+def yahoo_candles(
+    symbol: str = Query(..., description="رمز السهم، مثال: AAPL"),
+    period: str = Query("6mo", description="الفترة: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max"),
+    interval: str = Query("1d", description="الفاصل: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo")
+):
+    """
+    جلب الشموع من Yahoo Finance Chart API
+    يعيد JSON مع الشموع والتقسيمات
+    """
     try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-                         params={"range": period, "interval": interval},
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}"
+        params = {
+            "range": period,
+            "interval": interval,
+            "includePrePost": "false",
+            "events": "div,split"
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        
+        if r.status_code != 200:
+            return {"success": False, "error": f"HTTP {r.status_code}", "candles": []}
+        
+        data = r.json()
+        
+        if "chart" not in data or "result" not in data["chart"] or not data["chart"]["result"]:
+            return {"success": False, "error": "No data available", "candles": []}
+        
+        result = data["chart"]["result"][0]
+        timestamps = result.get("timestamp", [])
+        indicators = result.get("indicators", {})
+        quote = indicators.get("quote", [{}])[0]
+        
+        if not timestamps or not quote:
+            return {"success": False, "error": "Empty data", "candles": []}
+        
+        opens = quote.get("open", [])
+        highs = quote.get("high", [])
+        lows = quote.get("low", [])
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+        
+        candles = []
+        for i in range(len(timestamps)):
+            if closes[i] is None:  # تخطي الشموع غير المكتملة
+                continue
+            candles.append({
+                "date": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(timestamps[i])),
+                "open": round(opens[i], 4) if opens[i] else 0,
+                "high": round(highs[i], 4) if highs[i] else 0,
+                "low": round(lows[i], 4) if lows[i] else 0,
+                "close": round(closes[i], 4),
+                "volume": int(volumes[i]) if volumes[i] else 0
+            })
+        
+        # جلب التقسيمات
+        splits = []
+        events = result.get("events", {})
+        if "splits" in events:
+            for date_str, split_data in events["splits"].items():
+                splits.append({
+                    "date": time.strftime("%Y-%m-%d", time.gmtime(int(date_str))),
+                    "numerator": split_data.get("numerator", 1),
+                    "denominator": split_data.get("denominator", 1)
+                })
+        
+        return {
+            "success": True,
+            "symbol": symbol.upper(),
+            "period": period,
+            "interval": interval,
+            "candles": candles,
+            "splits": splits,
+            "count": len(candles)
+        }
+        
+    except requests.Timeout:
+        return {"success": False, "error": "Request timeout", "candles": []}
+    except requests.RequestException as e:
+        return {"success": False, "error": str(e), "candles": []}
+    except Exception as e:
+        return {"success": False, "error": f"Internal error: {str(e)}", "candles": []}
+
+# ===== Yahoo Finance Last Quote (مجمّع) =====
+
+@app.get("/yahoo/last")
+def yahoo_last(
+    symbols: str = Query(..., description="رموز مفصولة بفاصلة، مثال: AAPL,MSFT,GOOGL")
+):
+    """
+    جلب آخر اقتباس لعدة رموز دفعة واحدة
+    يستخدم Yahoo Finance v8 chart API لكل رمز
+    """
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    
+    if not symbol_list:
+        return {"ok": False, "error": "No symbols provided", "quotes": {}}
+    
+    if len(symbol_list) > 200:
+        return {"ok": False, "error": "Maximum 200 symbols per request", "quotes": {}}
+    
+    quotes = {}
+    
+    def fetch_one(symbol):
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            params = {
+                "range": "1d",
+                "interval": "1d",
+                "includePrePost": "false"
+            }
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            
+            if r.status_code != 200:
+                return symbol, None
+            
+            data = r.json()
+            
+            if "chart" not in data or "result" not in data["chart"] or not data["chart"]["result"]:
+                return symbol, None
+            
+            result = data["chart"]["result"][0]
+            meta = result.get("meta", {})
+            
+            price = meta.get("regularMarketPrice", 0)
+            volume = meta.get("regularMarketVolume", 0)
+            
+            if price and price > 0:
+                return symbol, {
+                    "price": round(price, 4),
+                    "volume": int(volume) if volume else 0,
+                    "currency": meta.get("currency", "USD"),
+                    "exchange": meta.get("exchangeName", "")
+                }
+            return symbol, None
+            
+        except Exception:
+            return symbol, None
+    
+    # جلب متوازي
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_one, sym): sym for sym in symbol_list}
+        for future in futures:
+            symbol, data = future.result()
+            if data:
+                quotes[symbol] = data
+    
+    return {
+        "ok": True,
+        "quotes": quotes,
+        "count": len(quotes),
+        "requested": len(symbol_list)
+    }
+
+# ===== نقطة فحص单个 رمز =====
+
+@app.get("/yahoo/quote")
+def yahoo_quote(symbol: str = Query(..., description="رمز السهم")):
+    """جلب اقتباس مفصل لرمز واحد"""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}"
+        params = {
+            "range": "1d",
+            "interval": "1d",
+            "includePrePost": "false"
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        
         if r.status_code != 200:
             return {"success": False, "error": f"HTTP {r.status_code}"}
+        
         data = r.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return {"success": False, "error": "no result"}
-        res = result[0]
-        ts = res.get("timestamp", [])
-        q = res.get("indicators", {}).get("quote", [{}])[0]
-        candles = []
-        for i, t in enumerate(ts):
-            o = (q.get("open") or [None]*len(ts))[i]
-            h = (q.get("high") or [None]*len(ts))[i]
-            l = (q.get("low") or [None]*len(ts))[i]
-            c = (q.get("close") or [None]*len(ts))[i]
-            v = (q.get("volume") or [None]*len(ts))[i]
-            if None in (o, h, l, c): continue
-            candles.append({"date": t, "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
-        splits = []
-        ev = res.get("events", {}).get("splits")
-        if ev:
-            for s in ev:
-                splits.append({"date": s.get("date"), "numerator": s.get("numerator", 1),
-                               "denominator": s.get("denominator", 1)})
-        return {"success": True, "candles": candles, "splits": splits}
+        
+        if "chart" not in data or "result" not in data["chart"] or not data["chart"]["result"]:
+            return {"success": False, "error": "No data"}
+        
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        
+        return {
+            "success": True,
+            "symbol": symbol.upper(),
+            "price": meta.get("regularMarketPrice", 0),
+            "previousClose": meta.get("chartPreviousClose", 0),
+            "volume": meta.get("regularMarketVolume", 0),
+            "currency": meta.get("currency", "USD"),
+            "exchange": meta.get("exchangeName", ""),
+            "marketCap": meta.get("marketCap", 0)
+        }
+        
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-@app.get("/yahoo/last")
-def yahoo_last(symbols: str = ""):
-    """اقتباسات مجمّعة لآخر سعر وحجم (لـ discovery pool)"""
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:200]
-    out = {}
-    def one(s):
-        try:
-            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{s}",
-                             params={"range": "5d", "interval": "1d"},
-                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            if r.status_code != 200: return
-            meta = r.json()["chart"]["result"][0]["meta"]
-            p = meta.get("regularMarketPrice") or 0
-            v = meta.get("regularMarketVolume") or 0
-            if p: out[s] = {"price": p, "volume": v}
-        except Exception: pass
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        list(ex.map(one, syms))
-    return {"ok": True, "quotes": out}
+# ===== تشغيل الخادم =====
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
