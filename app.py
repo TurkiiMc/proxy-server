@@ -1,9 +1,11 @@
 """
-Server — Yahoo Finance API Proxy (v1.2 مُقوّى)
-يوفر نقاط وصول للشموع والاقتباسات مع حماية من الاختناق:
-- سقف تزامن 16 اتصال Yahoo فقط في اللحظة (يمنع 503 أثناء الـ sweep)
+Server — Yahoo Finance API Proxy (v1.2.1)
+يوفر نقاط وصول للشموع والاقتباسات مع مناعة كاملة:
+- سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري قصير (60s اقتباسات / 300s شموع) لامتصاص تكرار بوت+محرك+تطبيق
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً حتى تحت العاصفة)
+- v1.2.1: مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429
+           + تسجيل كل فشل في السجلات (لا مزيد من الأخطاء الصامتة)
 """
 import os, time, threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,14 +13,15 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.2.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.2.1")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-YAHOO_WORKERS = 16          # ✅ سقف التزامن (كان بلا سقف = اختناق)
-QUOTE_TTL = 60              # ثانية
-CANDLE_TTL = 300            # ثانية
+CHART_HOSTS = ["https://query1.finance.yahoo.com",
+               "https://query2.finance.yahoo.com"]
+YAHOO_WORKERS = 16          # سقف التزامن الخارجي
+QUOTE_TTL = 60              # ثانية لكاش الاقتباس
+CANDLE_TTL = 300            # ثانية لكاش الشموع
 BULK_CAP = 150              # أقصى رموز في طلب واحد
 
 exec_pool = ThreadPoolExecutor(max_workers=YAHOO_WORKERS)
@@ -40,18 +43,32 @@ def cache_set(key, val):
             _cache.clear()
         _cache[key] = (time.time(), val)
 
-# ===== نواة Yahoo =====
+# ===== نواة Yahoo (مضيفان + محاولتان + تهدئة) =====
 def _chart(sym, range_, interval):
-    r = requests.get(CHART.format(sym=sym),
-                     params={"range": range_, "interval": interval,
-                             "includePrePost": "false"},
-                     headers=UA, timeout=15)
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}"
-    data = r.json()
-    if "chart" not in data or "result" not in data or not data["chart"]["result"]:
-        return None, "No data"
-    return data["chart"]["result"][0], None
+    last_err = "no attempt"
+    for host in CHART_HOSTS:
+        for attempt in range(2):
+            try:
+                r = requests.get(f"{host}/v8/finance/chart/{sym}",
+                                 params={"range": range_, "interval": interval,
+                                         "includePrePost": "false"},
+                                 headers=UA, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    res = (data.get("chart") or {}).get("result")
+                    if res:
+                        return res[0], None
+                    last_err = "No data"
+                elif r.status_code == 429:
+                    last_err = "HTTP 429"
+                    time.sleep(1.5 + attempt)
+                    continue
+                else:
+                    last_err = f"HTTP {r.status_code}"
+            except Exception as e:
+                last_err = str(e)
+            time.sleep(0.8)
+    return None, last_err
 
 def _meta_quote(result):
     meta = result.get("meta", {})
@@ -96,6 +113,7 @@ def yahoo_candles(
     try:
         result, err = _chart(sym, period, interval)
         if err:
+            print(f"[proxy] candles fail {sym}: {err}")
             return {"success": False, "error": err}
         ts = result.get("timestamp") or []
         q = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
@@ -120,15 +138,18 @@ def yahoo_candles(
         cache_set(key, out)
         return out
     except Exception as e:
+        print(f"[proxy] candles exc {sym}: {e}")
         return {"success": False, "error": str(e)}
 
 def _one_quote(sym):
     try:
         result, err = _chart(sym, "1d", "1d")
         if err:
+            print(f"[proxy] quote fail {sym}: {err}")
             return sym, None
         return sym, _meta_quote(result)
-    except Exception:
+    except Exception as e:
+        print(f"[proxy] quote exc {sym}: {e}")
         return sym, None
 
 @app.get("/yahoo/quote")
@@ -162,8 +183,10 @@ def yahoo_last(
                 if q:
                     quotes[sym] = q
                     cache_set(f"q:{sym}", q)
-        except Exception:
-            pass  # نُرجع ما تجمع فقط — أفضل من فشل كامل
+        except Exception as e:
+            print(f"[proxy] bulk partial: {e}")  # نُرجع ما تجمع فقط
+    if todo and not quotes:
+        print(f"[proxy] ⚠️ دفعة فارغة: {len(todo)} رمزاً فشلت كلها")
     return {"success": True, "count": len(quotes), "quotes": quotes}
 
 # ===== تشغيل الخادم =====
