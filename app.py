@@ -1,11 +1,12 @@
 """
-Server — Yahoo Finance API Proxy (v1.3)
+Server — Yahoo Finance API Proxy (v1.5)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
-- كاش ذاكري قصير (60s اقتباسات / 300s شموع) لامتصاص تكرار بوت+محرك+تطبيق
-- /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً حتى تحت العاصفة)
-- مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429
-- تسجيل كل فشل في السجلات (لا مزيد من الأخطاء الصامتة)
-- v1.3: تحويل النقطة إلى شرطة لYahoo (BRK.A → BRK-A) + 404 فوري بلا إعادة محاولة
+- كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
+- /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
+- مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429 + 404 فوري
+- v1.3: تحويل النقطة→شرطة (BRK.A → BRK-A)
+- v1.5: جلسة Crumb لجلب الشورت والفلوت من quoteSummary (مصدر الوقود)
+- تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,16 +14,17 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.3.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.5.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 CHART_HOSTS = ["https://query1.finance.yahoo.com",
                "https://query2.finance.yahoo.com"]
-YAHOO_WORKERS = 16          # سقف التزامن الخارجي
-QUOTE_TTL = 60              # ثانية لكاش الاقتباس
-CANDLE_TTL = 300            # ثانية لكاش الشموع
-BULK_CAP = 150              # أقصى رموز في طلب واحد
+YAHOO_WORKERS = 16
+QUOTE_TTL = 60
+CANDLE_TTL = 300
+STATS_TTL = 3600
+BULK_CAP = 150
 
 exec_pool = ThreadPoolExecutor(max_workers=YAHOO_WORKERS)
 
@@ -45,7 +47,7 @@ def cache_set(key, val):
 
 # ===== نواة Yahoo =====
 def _y(sym):
-    # v1.3: Yahoo يريد شرطة لفئات الأسهم: BRK.A (Finnhub) → BRK-A (Yahoo)
+    # Yahoo يريد شرطة لفئات الأسهم: BRK.A (Finnhub) → BRK-A (Yahoo)
     return sym.replace(".", "-")
 
 def _chart(sym, range_, interval):
@@ -64,7 +66,7 @@ def _chart(sym, range_, interval):
                         return res[0], None
                     last_err = "No data"
                 elif r.status_code == 404:
-                    return None, "HTTP 404"   # v1.3: خطأ حتمي — لا إعادة محاولة
+                    return None, "HTTP 404"   # خطأ حتمي — لا إعادة محاولة
                 elif r.status_code == 429:
                     last_err = "HTTP 429"
                     time.sleep(1.5 + attempt)
@@ -87,6 +89,37 @@ def _meta_quote(result):
         "exchange": meta.get("exchangeName", ""),
         "marketCap": meta.get("marketCap", 0),
     }
+
+# ===== v1.5: جلسة Crumb لـ quoteSummary =====
+_crumb = {"session": None, "value": None, "ts": 0.0}
+_crumb_lock = threading.Lock()
+
+def _crumb_session():
+    with _crumb_lock:
+        now = time.time()
+        if _crumb["session"] and (now - _crumb["ts"]) < 1800:
+            return _crumb["session"], _crumb["value"]
+        s = requests.Session()
+        s.headers.update(UA)
+        try:
+            s.get("https://fc.yahoo.com", timeout=15)   # 404 متوقع — يضبط الـ cookie
+        except Exception:
+            pass
+        val = None
+        for host in CHART_HOSTS:
+            try:
+                r = s.get(f"{host}/v1/test/getcrumb", timeout=15)
+                if r.status_code == 200 and 0 < len(r.text.strip()) < 50:
+                    val = r.text.strip()
+                    break
+            except Exception:
+                continue
+        if val:
+            _crumb.update({"session": s, "value": val, "ts": now})
+            print("[proxy] crumb session OK ✅")
+            return s, val
+        print("[proxy] crumb session FAILED ❌")
+        return None, None
 
 # ===== نقاط الفحص والإيقاظ (لا تلمس Yahoo أبداً) =====
 @app.get("/", response_class=PlainTextResponse)
@@ -190,10 +223,51 @@ def yahoo_last(
                     quotes[sym] = q
                     cache_set(f"q:{sym}", q)
         except Exception as e:
-            print(f"[proxy] bulk partial: {e}")  # نُرجع ما تجمع فقط
+            print(f"[proxy] bulk partial: {e}")
     if todo and not quotes:
         print(f"[proxy] ⚠️ دفعة فارغة: {len(todo)} رمزاً فشلت كلها")
     return {"success": True, "count": len(quotes), "quotes": quotes}
+
+# ===== v1.5: مصدر الوقود (الشورت والفلوت) =====
+@app.get("/yahoo/stats")
+def yahoo_stats(symbol: str = Query(..., description="رمز السهم، مثال: CISS")):
+    """جلب الشورت والفلوت من quoteSummary عبر جلسة crumb"""
+    sym = symbol.strip().upper()
+    key = f"s:{sym}"
+    hit = cache_get(key, STATS_TTL)
+    if hit:
+        return hit
+    for attempt in range(2):
+        s, crumb = _crumb_session()
+        if not s:
+            return {"success": False, "error": "no crumb session"}
+        try:
+            r = s.get(f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{_y(sym)}",
+                      params={"modules": "defaultKeyStatistics", "crumb": crumb},
+                      timeout=15)
+            if r.status_code == 401 and attempt == 0:
+                with _crumb_lock:
+                    _crumb.update({"session": None, "value": None, "ts": 0.0})
+                continue
+            if r.status_code != 200:
+                print(f"[proxy] stats fail {sym}: HTTP {r.status_code}")
+                return {"success": False, "error": f"HTTP {r.status_code}"}
+            data = r.json()
+            ks = (data.get("quoteSummary") or {}).get("result", [{}])[0].get("defaultKeyStatistics", {})
+            def raw(v): return v.get("raw") if isinstance(v, dict) else v
+            out = {
+                "success": True, "symbol": sym,
+                "sharesShort": raw(ks.get("sharesShort")),
+                "shortPercentOfFloat": raw(ks.get("shortPercentOfFloat")),
+                "floatShares": raw(ks.get("floatShares")),
+                "shortRatio": raw(ks.get("shortRatio")),
+            }
+            cache_set(key, out)
+            return out
+        except Exception as e:
+            print(f"[proxy] stats exc {sym}: {e}")
+            return {"success": False, "error": str(e)}
+    return {"success": False, "error": "crumb retry failed"}
 
 # ===== تشغيل الخادم =====
 if __name__ == "__main__":
