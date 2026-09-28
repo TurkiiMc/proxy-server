@@ -1,11 +1,11 @@
 """
-Server — Yahoo Finance API Proxy (v1.2.1)
-يوفر نقاط وصول للشموع والاقتباسات مع مناعة كاملة:
+Server — Yahoo Finance API Proxy (v1.3)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري قصير (60s اقتباسات / 300s شموع) لامتصاص تكرار بوت+محرك+تطبيق
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً حتى تحت العاصفة)
-- v1.2.1: مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429
-           + تسجيل كل فشل في السجلات (لا مزيد من الأخطاء الصامتة)
+- مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429
+- تسجيل كل فشل في السجلات (لا مزيد من الأخطاء الصامتة)
+- v1.3: تحويل النقطة إلى شرطة لYahoo (BRK.A → BRK-A) + 404 فوري بلا إعادة محاولة
 """
 import os, time, threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +13,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.2.1")
+app = FastAPI(title="Faisal Proxy Server", version="1.3.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -43,13 +43,17 @@ def cache_set(key, val):
             _cache.clear()
         _cache[key] = (time.time(), val)
 
-# ===== نواة Yahoo (مضيفان + محاولتان + تهدئة) =====
+# ===== نواة Yahoo =====
+def _y(sym):
+    # v1.3: Yahoo يريد شرطة لفئات الأسهم: BRK.A (Finnhub) → BRK-A (Yahoo)
+    return sym.replace(".", "-")
+
 def _chart(sym, range_, interval):
     last_err = "no attempt"
     for host in CHART_HOSTS:
         for attempt in range(2):
             try:
-                r = requests.get(f"{host}/v8/finance/chart/{sym}",
+                r = requests.get(f"{host}/v8/finance/chart/{_y(sym)}",
                                  params={"range": range_, "interval": interval,
                                          "includePrePost": "false"},
                                  headers=UA, timeout=15)
@@ -59,6 +63,8 @@ def _chart(sym, range_, interval):
                     if res:
                         return res[0], None
                     last_err = "No data"
+                elif r.status_code == 404:
+                    return None, "HTTP 404"   # v1.3: خطأ حتمي — لا إعادة محاولة
                 elif r.status_code == 429:
                     last_err = "HTTP 429"
                     time.sleep(1.5 + attempt)
