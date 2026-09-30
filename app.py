@@ -1,11 +1,12 @@
 """
-Server — Yahoo Finance API Proxy (v1.5)
+Server — Yahoo Finance API Proxy (v1.6)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
 - مضيفان بديلان (query1/query2) + محاولتان + تهدئة عند 429 + 404 فوري
 - v1.3: تحويل النقطة→شرطة (BRK.A → BRK-A)
 - v1.5: جلسة Crumb لجلب الشورت والفلوت من quoteSummary (مصدر الوقود)
+- v1.6: /ibkr/borrow رسوم الاقتراض والمتاح من ملف IBKR العام (كاش 15 دقيقة)
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -14,7 +15,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.5.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.6.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -268,6 +269,67 @@ def yahoo_stats(symbol: str = Query(..., description="رمز السهم، مثا
             print(f"[proxy] stats exc {sym}: {e}")
             return {"success": False, "error": str(e)}
     return {"success": False, "error": "crumb retry failed"}
+
+# ===== v1.6: رسوم الاقتراض من IBKR (ملف FTP العام — نفس مصدر IBorrowDesk) =====
+import io, ftplib
+
+IBKR_TTL = 900   # الملف يتحدث كل ~15 دقيقة عند IBKR
+_ibkr = {"ts": 0.0, "data": {}, "err": None, "file_time": None}
+_ibkr_lock = threading.Lock()
+
+def _ibkr_load():
+    """يحمّل usa.txt مرة كل 15 دقيقة ويحفظه في الذاكرة. عند الفشل يعيد آخر نسخة ناجحة (إن وُجدت)"""
+    with _ibkr_lock:
+        if _ibkr["data"] and (time.time() - _ibkr["ts"]) < IBKR_TTL:
+            return _ibkr["data"], None
+        try:
+            buf = io.BytesIO()
+            with ftplib.FTP("ftp3.interactivebrokers.com", timeout=60) as ftp:
+                ftp.login(user="shortstock", passwd="")
+                ftp.retrbinary("RETR usa.txt", buf.write)
+            text = buf.getvalue().decode("utf-8", errors="ignore")
+            data, header, stamp = {}, None, None
+            for ln in text.splitlines():
+                if ln.startswith("#BOF"):
+                    stamp = " ".join(p.strip() for p in ln.split("|")[1:3]); continue
+                if ln.startswith("#SYM"):
+                    header = [h.strip().lstrip("#") for h in ln.split("|")]; continue
+                if ln.startswith("#") or not header:
+                    continue
+                row = dict(zip(header, ln.split("|")))
+                sym = (row.get("SYM") or "").strip().upper()
+                if not sym:
+                    continue
+                try:
+                    fee = float(row.get("FEERATE") or 0)
+                except ValueError:
+                    fee = None
+                av_raw = (row.get("AVAILABLE") or "0").strip()
+                try:
+                    av = float(av_raw.replace(">", "").replace(",", ""))
+                except ValueError:
+                    av = 0.0
+                data[sym] = {"fee": fee, "available": av, "available_raw": av_raw}
+            if not data:
+                raise RuntimeError("الملف فارغ")
+            _ibkr.update(ts=time.time(), data=data, err=None, file_time=stamp)
+            print(f"[proxy] IBKR borrow OK ✅ {len(data)} رمزاً ({stamp})")
+            return data, None
+        except Exception as e:
+            _ibkr["err"] = str(e)
+            print(f"[proxy] IBKR borrow FAILED ❌ {e}")
+            return _ibkr["data"], str(e)
+
+@app.get("/ibkr/borrow")
+def ibkr_borrow(symbols: str = Query(..., description="رموز مفصولة بفواصل: NXTT,MYSZ")):
+    """رسوم الاقتراض السنوية % والأسهم المتاحة للاقتراض من IBKR"""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:500]
+    data, err = _ibkr_load()
+    if not data:
+        return {"success": False, "error": err or "no data"}
+    out = {s: data[s] for s in syms if s in data}
+    return {"success": True, "count": len(out), "file_time": _ibkr["file_time"],
+            "stale": bool(err), "error": err, "borrow": out}
 
 # ===== تشغيل الخادم =====
 if __name__ == "__main__":
