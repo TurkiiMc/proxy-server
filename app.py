@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.6)
+Server — Yahoo Finance API Proxy (v1.7)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -7,6 +7,7 @@ Server — Yahoo Finance API Proxy (v1.6)
 - v1.3: تحويل النقطة→شرطة (BRK.A → BRK-A)
 - v1.5: جلسة Crumb لجلب الشورت والفلوت من quoteSummary (مصدر الوقود)
 - v1.6: /ibkr/borrow رسوم الاقتراض والمتاح من ملف IBKR العام (كاش 15 دقيقة)
+- v1.7: /yahoo/candles?prepost=true يضيف التداول الممتد (قبل الافتتاح وبعد الإغلاق) — الافتراضي false كما كان
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -15,7 +16,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.6.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.7.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -51,14 +52,14 @@ def _y(sym):
     # Yahoo يريد شرطة لفئات الأسهم: BRK.A (Finnhub) → BRK-A (Yahoo)
     return sym.replace(".", "-")
 
-def _chart(sym, range_, interval):
+def _chart(sym, range_, interval, prepost=False):
     last_err = "no attempt"
     for host in CHART_HOSTS:
         for attempt in range(2):
             try:
                 r = requests.get(f"{host}/v8/finance/chart/{_y(sym)}",
                                  params={"range": range_, "interval": interval,
-                                         "includePrePost": "false"},
+                                         "includePrePost": "true" if prepost else "false"},
                                  headers=UA, timeout=15)
                 if r.status_code == 200:
                     data = r.json()
@@ -144,14 +145,15 @@ def yahoo_candles(
     symbol: str = Query(..., description="رمز السهم، مثال: AAPL"),
     period: str = Query("6mo", description="الفترة: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, max"),
     interval: str = Query("1d", description="الفاصل: 1d أو 1h أو 5m, 15m, 30m"),
+    prepost: bool = Query(False, description="true = إضافة التداول الممتد (للفواصل داخل اليوم فقط)"),
 ):
     sym = symbol.strip().upper()
-    key = f"c:{sym}:{period}:{interval}"
+    key = f"c:{sym}:{period}:{interval}:{int(prepost)}"
     hit = cache_get(key, CANDLE_TTL)
     if hit:
         return hit
     try:
-        result, err = _chart(sym, period, interval)
+        result, err = _chart(sym, period, interval, prepost)
         if err:
             print(f"[proxy] candles fail {sym}: {err}")
             return {"success": False, "error": err}
