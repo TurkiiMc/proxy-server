@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.7)
+Server — Yahoo Finance API Proxy (v1.8)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -8,6 +8,7 @@ Server — Yahoo Finance API Proxy (v1.7)
 - v1.5: جلسة Crumb لجلب الشورت والفلوت من quoteSummary (مصدر الوقود)
 - v1.6: /ibkr/borrow رسوم الاقتراض والمتاح من ملف IBKR العام (كاش 15 دقيقة)
 - v1.7: /yahoo/candles?prepost=true يضيف التداول الممتد (قبل الافتتاح وبعد الإغلاق) — الافتراضي false كما كان
+- v1.8: /watch مراقبة قائمة «قبل الخبر» كل 5 دقائق (سحب واسترداد، حركة مبكرة، صعود، كسر)
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -16,7 +17,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.7.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.8.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -332,6 +333,170 @@ def ibkr_borrow(symbols: str = Query(..., description="رموز مفصولة ب�
     out = {s: data[s] for s in syms if s in data}
     return {"success": True, "count": len(out), "file_time": _ibkr["file_time"],
             "stale": bool(err), "error": err, "borrow": out}
+
+
+
+# =====================================================================
+# v1.8: /watch — مراقبة قائمة «قبل الخبر» كل 5 دقائق (يستدعيها cron-job.org)
+# تقرأ القائمة من المستودع العام (data/coiled.json يكتبه الرادار)، وتجلب شموع 5 دقائق مع التداول الممتد،
+# وترسل إلى تيليجرام: 🌀 سحب واسترداد · ⚡ حركة مبكرة · 🚀 صعود · 📉 كسر مستوى التنبيه · 🛡️ هبوط على سهم بأمر.
+# كل نوع مرة واحدة لكل سهم في اليوم. مراقبة فقط — لا تحليل ولا أوامر.
+# متغيرات البيئة: COILED_URL · TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · WATCH_KEY (اختياري لحماية النقطة)
+# =====================================================================
+from datetime import datetime, timedelta, timezone
+
+WATCH = {"up_early_pct": 7.0,     # ⚡ حركة مبكرة (قبل الافتتاح/بعد الإغلاق) — احتمال تسريب قبل الخبر
+         "up_pct": 15.0,          # 🚀
+         "drop_pct": 8.0,         # 🛡️ لسهم عليه أمر
+         "max_symbols": 120}
+_watch_sent = {}                  # {"YYYY-MM-DD:SYM:kind": 1} — يُصفَّر يومياً
+_watch_lock = threading.Lock()
+_watch_last = {"at": None, "checked": 0, "alerts": 0, "nodata": 0, "error": None, "running": False}
+
+
+def _ny_now(ts=None):
+    """توقيت نيويورك بلا اعتماد على قاعدة المناطق (التوقيت الصيفي: الأحد الثاني من مارس → الأحد الأول من نوفمبر)"""
+    u = datetime.fromtimestamp(ts, timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    y = u.year
+    mar = datetime(y, 3, 8, 7, tzinfo=timezone.utc); mar += timedelta(days=(6 - mar.weekday()) % 7)
+    nov = datetime(y, 11, 1, 6, tzinfo=timezone.utc); nov += timedelta(days=(6 - nov.weekday()) % 7)
+    return u + timedelta(hours=-4 if mar <= u < nov else -5)
+
+
+def _tg(text):
+    tok, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        print("[watch] لا TELEGRAM_TOKEN/CHAT_ID"); return
+    try:
+        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                      json={"chat_id": chat, "text": text[:4000]}, timeout=15)
+    except Exception as e:
+        print(f"[watch] telegram: {e}")
+
+
+def _sessions(result):
+    """من شموع 5 دقائق (يومان مع الممتد): آخر سعر وفترته، والمرجع، وقاع اليوم وحجمه"""
+    ts = result.get("timestamp") or []
+    q = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
+    bars = []
+    for i, t in enumerate(ts):
+        c = (q.get("close") or [None])[i] if i < len(q.get("close") or []) else None
+        if c is None:
+            continue
+        ny = _ny_now(t)
+        lo = (q.get("low") or [None] * len(ts))[i]
+        bars.append({"d": ny.date(), "m": ny.hour * 60 + ny.minute, "c": float(c),
+                     "l": float(lo if lo is not None else c), "v": float((q.get("volume") or [0] * len(ts))[i] or 0)})
+    reg = [b for b in bars if 570 <= b["m"] < 960]
+    if not bars or not reg:
+        return None
+    rdays = sorted({b["d"] for b in reg})
+    last = bars[-1]
+    if last["m"] < 240 or last["m"] >= 1200:
+        return None
+    today = last["d"]
+    if last["m"] < 570:
+        session, ref_d = "قبل الافتتاح", rdays[-1] if rdays[-1] < today else (rdays[-2] if len(rdays) > 1 else None)
+    elif last["m"] < 960:
+        session, ref_d = "الجلسة", rdays[-2] if len(rdays) > 1 and rdays[-1] == today else (rdays[-1] if rdays[-1] < today else None)
+    else:
+        session, ref_d = "بعد الإغلاق", today
+    if ref_d is None:
+        return None
+    ref = [b for b in reg if b["d"] == ref_d][-1]["c"]
+    day = [b for b in bars if b["d"] == today and 240 <= b["m"] < 1200]
+    if session == "بعد الإغلاق":
+        day = [b for b in day if b["m"] >= 960]          # قاع ما بعد الإغلاق فقط (لا قاع الجلسة)
+    return {"session": session, "px": last["c"], "ref": ref, "chg": (last["c"] / ref - 1) * 100,
+            "low": min(b["l"] for b in day), "vol": sum(b["v"] for b in day), "date": str(today)}
+
+
+def _watch_one(sym, v):
+    result, err = _chart(sym, "2d", "5m", True)
+    if err or not result:
+        return None, []
+    s = _sessions(result)
+    if not s:
+        return None, []
+    px, chg, low = s["px"], s["chg"], s["low"]
+    entry, stop = v.get("entry"), v.get("stop")
+    kind = (v.get("kinds") or [""])[0]
+    tail = f"({chg:+.1f}% {s['session']}) · السعر {px:.3f} · حجم {int(s['vol']):,}"
+    hits = []
+    lvl = next((L for L in (v.get("support"), v.get("alert")) if L and low < L * 0.99 and px > L), None)
+    if lvl:
+        hits.append(("reclaim", f"🌀 {sym} سحب واسترداد: نزل إلى {low:.3f} تحت {lvl} ثم عاد {tail}\n"
+                                f"   {kind} — راجع السهم: Limit قرب {lvl}، والوقف تحت {low:.3f}."))
+    if entry and chg <= -WATCH["drop_pct"]:
+        hits.append(("down", f"🛡️ {sym} {tail}\n   أمرك عند {entry}"
+                             + (f" — ⛔ تحت الوقف {stop}" if stop and px <= stop else " — قد يُنفَّذ في هبوط")
+                             + ". راجع الخبر أو ألغِ الأمر."))
+    if chg >= WATCH["up_pct"]:
+        hits.append(("up", f"🚀 {sym} {tail}\n   {kind} — " + (f"أمرك عند {entry} لن يُنفَّذ؛ لا مطاردة." if entry else "لا مطاردة.")))
+    elif chg >= WATCH["up_early_pct"] and s["session"] != "الجلسة":
+        hits.append(("early", f"⚡ {sym} حركة {s['session']} {tail}\n   {kind} — قد يسبق خبراً. راقب، لا مطاردة."))
+    al = v.get("alert")
+    if not entry and al and px < al and not lvl:
+        hits.append(("alert", f"📉 {sym} كسر مستوى التنبيه {al} {tail}\n   {kind} — إن عاد فوق {al} فهو سحب واسترداد (سيصلك 🌀)."))
+    return s["date"], hits
+
+
+def _watch_run():
+    st = _watch_last
+    try:
+        url = os.environ.get("COILED_URL")
+        if not url:
+            st["error"] = "لا COILED_URL"; return
+        r = requests.get(url, params={"t": int(time.time() // 300)}, timeout=20)
+        data = r.json() if r.status_code == 200 else {}
+        co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
+        co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
+        futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
+        msgs, nodata = [], 0
+        for s, f in futs.items():
+            try:
+                d, hits = f.result(timeout=60)
+            except Exception:
+                d, hits = None, []
+            if d is None:
+                nodata += 1; continue
+            for k, line in hits:
+                key = f"{d}:{s}:{k}"
+                with _watch_lock:
+                    if key in _watch_sent:
+                        continue
+                    if len(_watch_sent) > 5000:
+                        _watch_sent.clear()
+                    _watch_sent[key] = 1
+                msgs.append(line)
+        if msgs:
+            for i in range(0, len(msgs), 8):
+                _tg("👁️ مراقبة القائمة (كل 5 دقائق)\n" + "\n".join(msgs[i:i + 8]))
+        st.update({"checked": len(co), "alerts": len(msgs), "nodata": nodata, "error": None,
+                   "list_date": data.get("date")})
+        print(f"[watch] فُحص {len(co)} · تنبيهات {len(msgs)} · بلا بيانات {nodata}")
+    except Exception as e:
+        st["error"] = str(e); print(f"[watch] خطأ: {e}")
+    finally:
+        st["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds"); st["running"] = False
+
+
+@app.get("/watch")
+def watch(key: str = Query("", description="WATCH_KEY إن ضُبط")):
+    """يُستدعى كل 5 دقائق. يرد فوراً ويعمل في الخلفية (مهلة cron-job.org قصيرة)."""
+    need = os.environ.get("WATCH_KEY")
+    if need and key != need:
+        return {"ok": False, "error": "key"}
+    ny = _ny_now()
+    m = ny.hour * 60 + ny.minute
+    if ny.weekday() >= 5 or not (240 <= m < 1200):
+        return {"ok": True, "skipped": "خارج 4:00–20:00 نيويورك", "last": _watch_last}
+    if _watch_last["running"]:
+        return {"ok": True, "busy": True, "last": _watch_last}
+    _watch_last["running"] = True
+    threading.Thread(target=_watch_run, daemon=True).start()
+    return {"ok": True, "started": True, "last": _watch_last}
+
 
 # ===== تشغيل الخادم =====
 if __name__ == "__main__":
