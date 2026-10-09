@@ -341,7 +341,7 @@ def ibkr_borrow(symbols: str = Query(..., description="رموز مفصولة ب�
 # تقرأ القائمة من المستودع العام (data/coiled.json يكتبه الرادار)، وتجلب شموع 5 دقائق مع التداول الممتد،
 # وترسل إلى تيليجرام: 🌀 سحب واسترداد · ⚡ حركة مبكرة · 🚀 صعود · 📉 كسر مستوى التنبيه · 🛡️ هبوط على سهم بأمر.
 # كل نوع مرة واحدة لكل سهم في اليوم. مراقبة فقط — لا تحليل ولا أوامر.
-# متغيرات البيئة: COILED_URL · TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · WATCH_KEY (اختياري لحماية النقطة)
+# متغيرات البيئة: COILED_URL · TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · WATCH_KEY (اختياري) · GH_TOKEN (للمستودع الخاص)
 # =====================================================================
 from datetime import datetime, timedelta, timezone
 
@@ -447,7 +447,12 @@ def _watch_run():
         url = os.environ.get("COILED_URL")
         if not url:
             st["error"] = "لا COILED_URL"; return
-        r = requests.get(url, params={"t": int(time.time() // 300)}, timeout=20)
+        tok = os.environ.get("GH_TOKEN")          # للمستودع الخاص: مفتاح GitHub للقراءة فقط
+        hdr = {"Authorization": f"token {tok}"} if tok else {}
+        r = requests.get(url, params={"t": int(time.time() // 300)}, headers=hdr, timeout=20)
+        if r.status_code != 200:
+            st["error"] = f"تعذّر قراءة القائمة: HTTP {r.status_code}" + (" (مستودع خاص؟ أضف GH_TOKEN)" if r.status_code == 404 and not tok else "")
+            print(f"[watch] {st['error']}"); return
         data = r.json() if r.status_code == 200 else {}
         co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
         co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
