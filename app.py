@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.8)
+Server — Yahoo Finance API Proxy (v1.9)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -9,6 +9,7 @@ Server — Yahoo Finance API Proxy (v1.8)
 - v1.6: /ibkr/borrow رسوم الاقتراض والمتاح من ملف IBKR العام (كاش 15 دقيقة)
 - v1.7: /yahoo/candles?prepost=true يضيف التداول الممتد (قبل الافتتاح وبعد الإغلاق) — الافتراضي false كما كان
 - v1.8: /watch مراقبة قائمة «قبل الخبر» كل 5 دقائق (سحب واسترداد، حركة مبكرة، صعود، كسر)
+- v1.9: Massive بديلاً حين تخلو Yahoo من صفقات اليوم · /watch/test للمقارنة · لا تُقرأ صفقة الأمس كأنها اليوم
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -17,7 +18,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.8.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.9.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -411,17 +412,57 @@ def _sessions(result):
             "low": min(b["l"] for b in day), "vol": sum(b["v"] for b in day), "date": str(today)}
 
 
+# ---- v1.9: Massive (Polygon سابقاً) بديلاً حين لا تُظهر Yahoo صفقات اليوم ----
+MASSIVE_BASE = "https://api.massive.com"
+_mv_state = {"blocked_until": 0.0, "last_status": None}
+
+
+def _massive_result(sym):
+    """شموع 5 دقائق ليومين (تشمل الجلسات الممتدة) بصيغة Yahoo نفسها، أو None"""
+    key = os.environ.get("MASSIVE_API_KEY")
+    if not key or time.time() < _mv_state["blocked_until"]:
+        return None
+    today = _ny_now().date()
+    frm = str(today - timedelta(days=5))
+    try:
+        r = requests.get(f"{MASSIVE_BASE}/v2/aggs/ticker/{_y(sym)}/range/5/minute/{frm}/{today}",
+                         params={"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": key}, timeout=20)
+    except Exception as e:
+        _mv_state["last_status"] = str(e); return None
+    _mv_state["last_status"] = r.status_code
+    if r.status_code == 429:                       # حد الطلبات: توقف دقيقتين
+        _mv_state["blocked_until"] = time.time() + 120; return None
+    if r.status_code != 200:
+        return None
+    rows = (r.json() or {}).get("results") or []
+    if not rows:
+        return None
+    return {"timestamp": [int(x["t"] // 1000) for x in rows],
+            "indicators": {"quote": [{"open": [x.get("o") for x in rows], "high": [x.get("h") for x in rows],
+                                      "low": [x.get("l") for x in rows], "close": [x.get("c") for x in rows],
+                                      "volume": [x.get("v") or 0 for x in rows]}]}}
+
+
+def _fresh(s):
+    """الملخص لليوم الحالي بنيويورك (لا صفقة الأمس متأخرة تُقرأ كأنها اليوم)"""
+    return bool(s) and s["date"] == str(_ny_now().date())
+
+
 def _watch_one(sym, v):
     result, err = _chart(sym, "2d", "5m", True)
-    if err or not result:
-        return None, []
-    s = _sessions(result)
-    if not s:
+    s = _sessions(result) if (result and not err) else None
+    src = "Yahoo"
+    if not _fresh(s):
+        mres = _massive_result(sym)
+        ms = _sessions(mres) if mres else None
+        if _fresh(ms):
+            s, src = ms, "Massive"
+    if not _fresh(s):
         return None, []
     px, chg, low = s["px"], s["chg"], s["low"]
     entry, stop = v.get("entry"), v.get("stop")
     kind = (v.get("kinds") or [""])[0]
-    tail = f"({chg:+.1f}% {s['session']}) · السعر {px:.3f} · حجم {int(s['vol']):,}"
+    tail = f"({chg:+.1f}% {s['session']}) · السعر {px:.3f} · حجم {int(s['vol']):,}" + (" · Massive" if src == "Massive" else "")
     hits = []
     lvl = next((L for L in (v.get("support"), v.get("alert")) if L and low < L * 0.99 and px > L), None)
     if lvl:
@@ -484,6 +525,33 @@ def _watch_run():
         st["error"] = str(e); print(f"[watch] خطأ: {e}")
     finally:
         st["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds"); st["running"] = False
+
+
+@app.get("/watch/test")
+def watch_test(symbol: str = Query("GNPX"), key: str = Query("")):
+    """يقارن Yahoo وMassive لسهم: عدد شموع ما قبل الافتتاح/الجلسة/ما بعد الإغلاق لآخر يومين، وحالة Massive"""
+    need = os.environ.get("WATCH_KEY")
+    if need and key != need:
+        return {"ok": False, "error": "key"}
+    sym = symbol.strip().upper()
+
+    def count(res):
+        if not res:
+            return None
+        out = {}
+        for t in res.get("timestamp") or []:
+            ny = _ny_now(t); m = ny.hour * 60 + ny.minute
+            seg = "قبل الافتتاح" if 240 <= m < 570 else "الجلسة" if m < 960 else "بعد الإغلاق" if m < 1200 else "خارج"
+            k = f"{ny.date()} {seg}"
+            out[k] = out.get(k, 0) + 1
+        return out
+    y, err = _chart(sym, "5d", "5m", True)
+    _mv_state["blocked_until"] = 0
+    mv = _massive_result(sym)
+    return {"symbol": sym, "yahoo": count(y) if not err else err, "massive": count(mv),
+            "massive_status": _mv_state["last_status"],
+            "massive_key": bool(os.environ.get("MASSIVE_API_KEY")),
+            "note": "massive_status: 200 يعمل · 403 غير مشمول في خطتك · 401 مفتاح خاطئ · 429 حد الطلبات"}
 
 
 @app.get("/watch")
