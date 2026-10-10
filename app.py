@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.9)
+Server — Yahoo Finance API Proxy (v1.12)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -10,6 +10,9 @@ Server — Yahoo Finance API Proxy (v1.9)
 - v1.7: /yahoo/candles?prepost=true يضيف التداول الممتد (قبل الافتتاح وبعد الإغلاق) — الافتراضي false كما كان
 - v1.8: /watch مراقبة قائمة «قبل الخبر» كل 5 دقائق (سحب واسترداد، حركة مبكرة، صعود، كسر)
 - v1.9: Massive بديلاً حين تخلو Yahoo من صفقات اليوم · /watch/test للمقارنة · لا تُقرأ صفقة الأمس كأنها اليوم
+- v1.10: /watch/replay يعيد تشغيل المراقب على أيام سابقة (متى كان سينبّه، ومتى بلغت الحركة ذروتها)
+- v1.11: /h4/compare يقارن حدود 4H (Webull · ساعة ثابتة · الجلسة الرسمية) لمطابقة Webull وتطبيق فيصل
+- v1.12: المراقب بقواعد فيصل — 🌀 سحب 4–15% فقط، و🧱 كسر أعمق، و🎯 اختبار منطقة الدعم (10–20% تحت اختبار المقاومة)
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -18,7 +21,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.9.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.12.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -349,6 +352,8 @@ from datetime import datetime, timedelta, timezone
 WATCH = {"up_early_pct": 7.0,     # ⚡ حركة مبكرة (قبل الافتتاح/بعد الإغلاق) — احتمال تسريب قبل الخبر
          "up_pct": 15.0,          # 🚀
          "drop_pct": 8.0,         # 🛡️ لسهم عليه أمر
+         "sweep_min_pct": 4.0,    # 🌀 سحب فيصل: نزول 4–15% تحت الدعم ثم عودة فوقه («سحب 5% تقريباً» KUST، «10%>15%» مثاله)
+         "sweep_max_pct": 15.0,   #    أعمق من ذلك = كسر لا سحب
          "max_symbols": 120}
 _watch_sent = {}                  # {"YYYY-MM-DD:SYM:kind": 1} — يُصفَّر يومياً
 _watch_lock = threading.Lock()
@@ -450,6 +455,8 @@ def _fresh(s):
 
 def _watch_one(sym, v):
     result, err = _chart(sym, "2d", "5m", True)
+    if err and "429" in str(err):
+        return "429", []                           # حد طلبات Yahoo — يُحسب في الجولة للتهدئة
     s = _sessions(result) if (result and not err) else None
     src = "Yahoo"
     if not _fresh(s):
@@ -464,10 +471,21 @@ def _watch_one(sym, v):
     kind = (v.get("kinds") or [""])[0]
     tail = f"({chg:+.1f}% {s['session']}) · السعر {px:.3f} · حجم {int(s['vol']):,}" + (" · Massive" if src == "Massive" else "")
     hits = []
-    lvl = next((L for L in (v.get("support"), v.get("alert")) if L and low < L * 0.99 and px > L), None)
+    mn, mx = WATCH["sweep_min_pct"] / 100, WATCH["sweep_max_pct"] / 100
+    lvl = next((L for L in (v.get("support"), v.get("alert"))
+                if L and L * (1 - mx) <= low <= L * (1 - mn) and px > L), None)
     if lvl:
-        hits.append(("reclaim", f"🌀 {sym} سحب واسترداد: نزل إلى {low:.3f} تحت {lvl} ثم عاد {tail}\n"
-                                f"   {kind} — راجع السهم: Limit قرب {lvl}، والوقف تحت {low:.3f}."))
+        dep = (1 - low / lvl) * 100
+        hits.append(("reclaim", f"🌀 {sym} سحب واسترداد: نزل {dep:.0f}% إلى {low:.3f} تحت {lvl} ثم عاد {tail}\n"
+                                f"   {kind} — «هنا تقرر دخولك إذا ارتد مباشرة»: Limit قرب {lvl}، والوقف تحت {low:.3f} مباشرة."))
+    sup_ = v.get("support")
+    if sup_ and low < sup_ * (1 - mx) and px < sup_:
+        hits.append(("break", f"🧱 {sym} كسر الدعم {sup_} بأكثر من {WATCH['sweep_max_pct']:.0f}% (أدنى {low:.3f}) {tail}\n"
+                              f"   {kind} — كسر لا سحب. قاعدة فيصل: 5 جلسات إضافية ثم الدخول قرب أدنى سعر إن لم يُكسر."))
+    zn = v.get("zone") or []
+    if len(zn) == 2 and zn[0] and zn[1] and not lvl and zn[0] <= low <= zn[1] and px >= zn[0]:
+        hits.append(("zone", f"🎯 {sym} يختبر منطقة الدعم {zn[0]:.4g}–{zn[1]:.4g} (10–20% تحت اختبار المقاومة {v.get('res_test')}) {tail}\n"
+                             f"   {kind} — «تبقى اختبار دعم»: راقب الثبات، والتأكيد إغلاق فوق قمة شمعة الاختبار."))
     if entry and chg <= -WATCH["drop_pct"]:
         hits.append(("down", f"🛡️ {sym} {tail}\n   أمرك عند {entry}"
                              + (f" — ⛔ تحت الوقف {stop}" if stop and px <= stop else " — قد يُنفَّذ في هبوط")
@@ -498,12 +516,14 @@ def _watch_run():
         co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
         co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
         futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
-        msgs, nodata = [], 0
+        msgs, nodata, limited = [], 0, 0
         for s, f in futs.items():
             try:
                 d, hits = f.result(timeout=60)
             except Exception:
                 d, hits = None, []
+            if d == "429":
+                limited += 1; continue
             if d is None:
                 nodata += 1; continue
             for k, line in hits:
@@ -518,13 +538,175 @@ def _watch_run():
         if msgs:
             for i in range(0, len(msgs), 8):
                 _tg("👁️ مراقبة القائمة (كل 5 دقائق)\n" + "\n".join(msgs[i:i + 8]))
-        st.update({"checked": len(co), "alerts": len(msgs), "nodata": nodata, "error": None,
+        # حماية عنوان الخادم: إن رفضت Yahoo كثيراً (429) نهدأ 15 دقيقة — الرادار يستخدم البروكسي نفسه
+        if limited >= max(5, len(co) // 10):
+            st["cooldown_until"] = time.time() + 900
+            print(f"[watch] ⚠️ Yahoo رفضت {limited} طلباً (429) — تهدئة 15 دقيقة")
+        st.update({"checked": len(co), "alerts": len(msgs), "nodata": nodata, "limited_429": limited, "error": None,
                    "list_date": data.get("date")})
         print(f"[watch] فُحص {len(co)} · تنبيهات {len(msgs)} · بلا بيانات {nodata}")
     except Exception as e:
         st["error"] = str(e); print(f"[watch] خطأ: {e}")
     finally:
         st["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds"); st["running"] = False
+
+
+def _riyadh(t):
+    return (datetime.fromtimestamp(t, timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
+
+
+@app.get("/watch/replay", response_class=PlainTextResponse)
+def watch_replay(symbols: str = Query(..., description="حتى 8 رموز: PMAX,INLF"), days: int = Query(30),
+                 key: str = Query(""), all: int = Query(0, description="1 = كل الأيام لا أيام الحركة فقط")):
+    """يعيد تشغيل منطق المراقب على شموع Yahoo الحقيقية (5 دقائق مع الممتد) لأيام سابقة:
+    متى كان سيرسل ⚡ و🚀، وكم بلغت الحركة قبل الافتتاح وفي الجلسة وبعد الإغلاق، وهل وصلت صفقات ما قبل الافتتاح أصلاً."""
+    need = os.environ.get("WATCH_KEY")
+    if need and key != need:
+        return "key"
+    syms = [x.strip().upper() for x in symbols.split(",") if x.strip()][:8]
+    rng = "5d" if days <= 5 else "1mo" if days <= 30 else "60d"
+    E, U = WATCH["up_early_pct"], WATCH["up_pct"]
+    out = [f"إعادة تشغيل المراقب على بيانات Yahoo — الفترة {rng}",
+           f"⚡ = +{E:.0f}% خارج الجلسة · 🚀 = +{U:.0f}% · الأوقات: نيويورك (الرياض) · التنبيه الفعلي خلال 5 دقائق من الوقت المذكور",
+           ""]
+    for sym in syms:
+        res, err = _chart(sym, rng, "5m", True)
+        if err or not res:
+            out += [f"■ {sym}: لا بيانات ({err})", ""]; continue
+        ts = res.get("timestamp") or []
+        q = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        cl, hi = q.get("close") or [], q.get("high") or []
+        bars = []
+        for i, t in enumerate(ts):
+            c = cl[i] if i < len(cl) else None
+            if c is None:
+                continue
+            h = hi[i] if i < len(hi) and hi[i] is not None else c
+            ny = _ny_now(t)
+            bars.append((ny.date(), ny.hour * 60 + ny.minute, float(c), float(h), t))
+        days_ = sorted({b[0] for b in bars})
+        reg_close = {}
+        for d in days_:
+            r = [b for b in bars if b[0] == d and 570 <= b[1] < 960]
+            if r:
+                reg_close[d] = r[-1][2]
+        out.append(f"■ {sym}")
+        prev, shown, pre_ok, n_days = None, 0, 0, 0
+
+        def seg_line(seg, ref, name, early):
+            if not seg or not ref:
+                return f"{name}: لا صفقات", 0.0
+            mx = max(seg, key=lambda b: b[3])
+            mxp = (mx[3] / ref - 1) * 100
+            f_e = next((b for b in seg if (b[2] / ref - 1) * 100 >= E), None) if early else None
+            f_u = next((b for b in seg if (b[2] / ref - 1) * 100 >= U), None)
+            txt = f"{name}: أقصى {mxp:+.1f}% عند {_ny_now(mx[4]).strftime('%H:%M')} ({_riyadh(mx[4])})"
+            if f_e and not (f_u and f_u[4] <= f_e[4]):
+                txt += f" · ⚡ {_ny_now(f_e[4]).strftime('%H:%M')} ({_riyadh(f_e[4])})"
+            if f_u:
+                txt += f" · 🚀 {_ny_now(f_u[4]).strftime('%H:%M')} ({_riyadh(f_u[4])})"
+            return txt + f" · {len(seg)} شمعة", mxp
+
+        for d in days_:
+            if prev is None:
+                prev = reg_close.get(d)
+                continue
+            n_days += 1
+            pre = [b for b in bars if b[0] == d and 240 <= b[1] < 570]
+            reg = [b for b in bars if b[0] == d and 570 <= b[1] < 960]
+            post = [b for b in bars if b[0] == d and 960 <= b[1] < 1200]
+            pre_ok += 1 if pre else 0
+            l1, m1 = seg_line(pre, prev, "قبل الافتتاح", True)
+            l2, m2 = seg_line(reg, prev, "الجلسة", False)
+            l3, m3 = seg_line(post, reg_close.get(d), "بعد الإغلاق", True)
+            if all or max(m1, m2, m3) >= E:
+                out += [f"{d}", f"  {l1}", f"  {l2}", f"  {l3}"]
+                shown += 1
+            prev = reg_close.get(d) or prev
+        if not shown:
+            out.append(f"  لا حركة ≥{E:.0f}% في الفترة")
+        out += [f"  تغطية ما قبل الافتتاح في Yahoo: {pre_ok} من {n_days} يوماً فيها صفقات", ""]
+    return "\n".join(out)
+
+
+# ---- v1.11: مقارنة حدود شموع 4H بقيم Webull وتطبيق فيصل ----
+_H4_BINS = {"webull": [(240, 480), (480, 570), (570, 810), (810, 960), (960, 1200)],
+            "clock": [(240, 480), (480, 720), (720, 960), (960, 1200)],
+            "regular": [(570, 810), (810, 960)]}
+
+
+def _ema_list(xs, n):
+    out, a = [], 2 / (n + 1)
+    for x in xs:
+        out.append(x if not out else out[-1] + a * (x - out[-1]))
+    return out
+
+
+def _rsi_last(cl, n=14):
+    if len(cl) < n + 2:
+        return None
+    up = dn = None
+    for i in range(1, len(cl)):
+        d = cl[i] - cl[i - 1]
+        u, w = max(d, 0.0), max(-d, 0.0)
+        up = u if up is None else up + (u - up) / n          # Wilder (كما في الرادار)
+        dn = w if dn is None else dn + (w - dn) / n
+    return round(100.0 if dn == 0 else 100 - 100 / (1 + up / dn), 2)
+
+
+def _macd_last(cl):
+    if len(cl) < 35:
+        return None
+    m = [a - b for a, b in zip(_ema_list(cl, 12), _ema_list(cl, 26))]
+    sg = _ema_list(m, 9)
+    return {"macd": round(m[-1], 4), "signal": round(sg[-1], 4), "hist": round(m[-1] - sg[-1], 4)}
+
+
+@app.get("/h4/compare", response_class=PlainTextResponse)
+def h4_compare(symbol: str = Query("NTCL"), key: str = Query("")):
+    """RSI14 وMACD لآخر شمعة 4H بثلاث طرق للتقسيم + RSI اليومي — للمطابقة مع Webull وتطبيق فيصل في الوقت نفسه"""
+    need = os.environ.get("WATCH_KEY")
+    if need and key != need:
+        return "key"
+    sym = symbol.strip().upper()
+    out = [f"{sym} — قارن هذه القيم بما يظهر في Webull (4 ساعات) وفي تطبيق فيصل الآن", ""]
+    d, err = _chart(sym, "6mo", "1d", False)
+    if d:
+        q = ((d.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        dc = [x for x in (q.get("close") or []) if x is not None]
+        out.append(f"اليومي: RSI14 {_rsi_last(dc)} · MACD {_macd_last(dc)}")
+    for mode, bins in _H4_BINS.items():
+        res, err = _chart(sym, "3mo", "1h", mode != "regular")
+        if err or not res:
+            out.append(f"{mode}: لا بيانات ({err})"); continue
+        q = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
+        groups, order = {}, []
+        for i, t in enumerate(res.get("timestamp") or []):
+            c = (q.get("close") or [None])[i] if i < len(q.get("close") or []) else None
+            if c is None:
+                continue
+            ny = _ny_now(t); m = ny.hour * 60 + ny.minute
+            b = next((a for a, z in bins if a <= m < z), None)
+            if b is None:
+                continue
+            k = (ny.date(), b)
+            if k not in groups:
+                order.append(k)
+            groups[k] = float(c)                     # آخر إغلاق داخل الشمعة
+        cl = [groups[k] for k in order]
+        last = order[-3:]
+        lbl = " · ".join(f"{k[0].strftime('%m-%d')} {k[1] // 60:02d}:{k[1] % 60:02d}" for k in last)
+        out.append(f"{mode}: RSI14 {_rsi_last(cl)} · MACD {_macd_last(cl)} · آخر الشموع: {lbl}")
+    res, err = _chart(sym, "5d", "1h", True)
+    if res:
+        ts = res.get("timestamp") or []
+        if ts:
+            day = _ny_now(ts[-1]).date()
+            hrs = [_ny_now(t).strftime("%H:%M") for t in ts if _ny_now(t).date() == day]
+            out += ["", f"أوقات شموع الساعة من Yahoo ليوم {day}: {' '.join(hrs)}"]
+    out += ["", "webull = حدود Webull (الافتراضي الآن) · clock = 4/8/12/16 · regular = الجلسة الرسمية فقط (القديم).",
+            "خلال السوق تختلف القيم بسبب الشمعة الجارية؛ قارن والسوق مغلق."]
+    return "\n".join(out)
 
 
 @app.get("/watch/test")
@@ -566,6 +748,8 @@ def watch(key: str = Query("", description="WATCH_KEY إن ضُبط")):
         return {"ok": True, "skipped": "خارج 4:00–20:00 نيويورك", "last": _watch_last}
     if _watch_last["running"]:
         return {"ok": True, "busy": True, "last": _watch_last}
+    if time.time() < (_watch_last.get("cooldown_until") or 0):
+        return {"ok": True, "cooldown": "تهدئة بعد رفض Yahoo (429)", "last": _watch_last}
     _watch_last["running"] = True
     threading.Thread(target=_watch_run, daemon=True).start()
     return {"ok": True, "started": True, "last": _watch_last}
