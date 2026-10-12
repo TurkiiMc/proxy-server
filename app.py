@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.12)
+Server — Yahoo Finance API Proxy (v1.14)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -13,6 +13,9 @@ Server — Yahoo Finance API Proxy (v1.12)
 - v1.10: /watch/replay يعيد تشغيل المراقب على أيام سابقة (متى كان سينبّه، ومتى بلغت الحركة ذروتها)
 - v1.11: /h4/compare يقارن حدود 4H (Webull · ساعة ثابتة · الجلسة الرسمية) لمطابقة Webull وتطبيق فيصل
 - v1.12: المراقب بقواعد فيصل — 🌀 سحب 4–15% فقط، و🧱 كسر أعمق، و🎯 اختبار منطقة الدعم (10–20% تحت اختبار المقاومة)
+- v1.13: رسالة واحدة مختصرة لكل جولة مجمّعة حسب النوع (سطر لكل سهم)، و🎯 و📉 و🧱 عند حدوثها اليوم فقط
+         (لا كل يوم والسهم ما زال فيها)، و🎯 لـ«جاهز» و«قريب» فقط، وأرقام مختصرة، وتسجيل رفض تيليجرام
+- v1.14: 🌀 السحب من 10% إلى 15% تحت الدعم (كان 4%) كما في «سبرنت داون 10% > 15%»
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -21,7 +24,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.12.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.14.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -352,7 +355,7 @@ from datetime import datetime, timedelta, timezone
 WATCH = {"up_early_pct": 7.0,     # ⚡ حركة مبكرة (قبل الافتتاح/بعد الإغلاق) — احتمال تسريب قبل الخبر
          "up_pct": 15.0,          # 🚀
          "drop_pct": 8.0,         # 🛡️ لسهم عليه أمر
-         "sweep_min_pct": 4.0,    # 🌀 سحب فيصل: نزول 4–15% تحت الدعم ثم عودة فوقه («سحب 5% تقريباً» KUST، «10%>15%» مثاله)
+         "sweep_min_pct": 10.0,   # 🌀 سحب فيصل: نزول 10–15% تحت الدعم ثم عودة فوقه («سبرنت داون 10% > 15%» — v1.14؛ كان 4%)
          "sweep_max_pct": 15.0,   #    أعمق من ذلك = كسر لا سحب
          "max_symbols": 120}
 _watch_sent = {}                  # {"YYYY-MM-DD:SYM:kind": 1} — يُصفَّر يومياً
@@ -372,12 +375,63 @@ def _ny_now(ts=None):
 def _tg(text):
     tok, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not tok or not chat:
-        print("[watch] لا TELEGRAM_TOKEN/CHAT_ID"); return
+        print("[watch] لا TELEGRAM_TOKEN/CHAT_ID"); return False
     try:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                      json={"chat_id": chat, "text": text[:4000]}, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          json={"chat_id": chat, "text": text[:4000]}, timeout=15)
+        if r.status_code != 200:                    # v1.13: رفض تيليجرام لم يعد صامتاً (توكن/معرّف/حظر)
+            print(f"[watch] telegram رفض {r.status_code}: {r.text[:200]}")
+            return False
+        return True
     except Exception as e:
         print(f"[watch] telegram: {e}")
+        return False
+
+
+def _n(x):
+    """رقم مختصر للعرض: 4 أرقام معنوية دون أصفار زائدة (1.600000023841858 ← 1.6 · 0.4710 ← 0.471)"""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:.4g}"
+
+
+RLM = "‏"                     # يبدأ به كل سطر ليُعرض من اليمين لليسار في تيليجرام ولو بدأ برمز لاتيني
+# ترتيب المجموعات في رسالة الجولة، وشرح كل نوع مرة واحدة في عنوانه
+WATCH_GROUPS = [
+    ("reclaim", "🌀 سحب واسترداد: «هنا تقرر دخولك إذا ارتد مباشرة»"),
+    ("up", "🚀 صعود قوي: لا مطاردة"),
+    ("early", "⚡ حركة خارج الجلسة: قد تسبق خبراً، راقب ولا تطارد"),
+    ("down", "🛡️ هبوط على سهم عليه أمر: راجع الخبر أو ألغِ الأمر"),
+    ("zone", "🎯 دخل منطقة الدعم اليوم: راقب الثبات، والتأكيد إغلاق فوق قمة شمعة الاختبار"),
+    ("break", "🧱 كسر الدعم بأكثر من {mx:g}% اليوم: كسر لا سحب، 5 جلسات ثم الدخول قرب أدنى سعر"),
+    ("alert", "📉 كسر مستوى التنبيه اليوم: إن نزل {mn:g}–{mx:g}% تحته ثم عاد فوقه يصلك 🌀"),
+]
+_TIER_RANK = {"✅": 0, "👀": 1, "👁️": 2}
+
+
+def _watch_digest(found):
+    """found: {نوع: [(رتبة الفئة، الرمز، السطر)]} ← رسائل تيليجرام (أقل من 3,500 حرف لكل رسالة)"""
+    head = f"{RLM}👁️ المراقب · {_riyadh(time.time())} بتوقيت الرياض"
+    blocks = []
+    for k, title in WATCH_GROUPS:
+        rows = sorted(found.get(k) or [])
+        if rows:
+            title = title.format(mn=WATCH["sweep_min_pct"], mx=WATCH["sweep_max_pct"])
+            blocks.append([f"{RLM}{title}"] + [f"{RLM}• {line}" for _, _, line in rows])
+    msgs, cur = [], [head]
+    for b in blocks:
+        for i, line in enumerate(b):
+            if sum(len(x) + 1 for x in cur) + len(line) > 3500:
+                msgs.append("\n".join(cur))
+                cur = [head + " (تابع)"] + ([b[0]] if i > 0 else [])
+            if i == 0 and len(cur) > 1:
+                cur.append("")
+            cur.append(line)
+    if len(cur) > 1:
+        msgs.append("\n".join(cur))
+    return msgs
 
 
 def _sessions(result):
@@ -466,37 +520,42 @@ def _watch_one(sym, v):
             s, src = ms, "Massive"
     if not _fresh(s):
         return None, []
-    px, chg, low = s["px"], s["chg"], s["low"]
+    px, chg, low, ref = s["px"], s["chg"], s["low"], s["ref"]
     entry, stop = v.get("entry"), v.get("stop")
-    kind = (v.get("kinds") or [""])[0]
-    tail = f"({chg:+.1f}% {s['session']}) · السعر {px:.3f} · حجم {int(s['vol']):,}" + (" · Massive" if src == "Massive" else "")
-    hits = []
+    tier = (v.get("kinds") or [""])[0]
+    icon = tier.split()[0] if tier.strip() else ""
+    actionable = ("جاهز" in tier) or ("قريب" in tier)          # «جاهز» و«قريب» — عليهما أوامر في منطقة الاختبار
+    rank = _TIER_RANK.get(icon, 3)
+    who = f"{sym} {icon}".strip()
+    pct = f"{chg:+.1f}%"
+    hits = []                                       # (النوع، الرتبة، السطر المختصر) — الشرح في عنوان المجموعة
     mn, mx = WATCH["sweep_min_pct"] / 100, WATCH["sweep_max_pct"] / 100
     lvl = next((L for L in (v.get("support"), v.get("alert"))
                 if L and L * (1 - mx) <= low <= L * (1 - mn) and px > L), None)
     if lvl:
         dep = (1 - low / lvl) * 100
-        hits.append(("reclaim", f"🌀 {sym} سحب واسترداد: نزل {dep:.0f}% إلى {low:.3f} تحت {lvl} ثم عاد {tail}\n"
-                                f"   {kind} — «هنا تقرر دخولك إذا ارتد مباشرة»: Limit قرب {lvl}، والوقف تحت {low:.3f} مباشرة."))
+        hits.append(("reclaim", rank, f"{who} {_n(px)}: نزل {dep:.0f}% إلى {_n(low)} تحت {_n(lvl)} ثم عاد · "
+                                      f"Limit قرب {_n(lvl)} والوقف تحت {_n(low)}"))
     sup_ = v.get("support")
-    if sup_ and low < sup_ * (1 - mx) and px < sup_:
-        hits.append(("break", f"🧱 {sym} كسر الدعم {sup_} بأكثر من {WATCH['sweep_max_pct']:.0f}% (أدنى {low:.3f}) {tail}\n"
-                              f"   {kind} — كسر لا سحب. قاعدة فيصل: 5 جلسات إضافية ثم الدخول قرب أدنى سعر إن لم يُكسر."))
+    # v1.13: الكسر والمنطقة ومستوى التنبيه «عند حدوثها اليوم» — كان المرجع (إغلاق الجلسة السابقة) فوق المستوى
+    if sup_ and low < sup_ * (1 - mx) and px < sup_ and ref >= sup_ * (1 - mx):
+        hits.append(("break", rank, f"{who} {_n(px)}: أدنى {_n(low)} تحت الدعم {_n(sup_)}"))
     zn = v.get("zone") or []
-    if len(zn) == 2 and zn[0] and zn[1] and not lvl and zn[0] <= low <= zn[1] and px >= zn[0]:
-        hits.append(("zone", f"🎯 {sym} يختبر منطقة الدعم {zn[0]:.4g}–{zn[1]:.4g} (10–20% تحت اختبار المقاومة {v.get('res_test')}) {tail}\n"
-                             f"   {kind} — «تبقى اختبار دعم»: راقب الثبات، والتأكيد إغلاق فوق قمة شمعة الاختبار."))
+    if (actionable and len(zn) == 2 and zn[0] and zn[1] and not lvl
+            and zn[0] <= low <= zn[1] and px >= zn[0] and ref > zn[1]):
+        hits.append(("zone", rank, f"{who} {_n(px)}: المنطقة {_n(zn[0])}–{_n(zn[1])}"
+                                   + (f" · اختبار المقاومة {_n(v.get('res_test'))}" if v.get("res_test") else "")))
     if entry and chg <= -WATCH["drop_pct"]:
-        hits.append(("down", f"🛡️ {sym} {tail}\n   أمرك عند {entry}"
-                             + (f" — ⛔ تحت الوقف {stop}" if stop and px <= stop else " — قد يُنفَّذ في هبوط")
-                             + ". راجع الخبر أو ألغِ الأمر."))
+        hits.append(("down", rank, f"{who} {_n(px)} ({pct}): أمرك عند {_n(entry)}"
+                                   + (f" · ⛔ تحت الوقف {_n(stop)}" if stop and px <= stop else " · قد يُنفَّذ")))
     if chg >= WATCH["up_pct"]:
-        hits.append(("up", f"🚀 {sym} {tail}\n   {kind} — " + (f"أمرك عند {entry} لن يُنفَّذ؛ لا مطاردة." if entry else "لا مطاردة.")))
+        hits.append(("up", rank, f"{who} {_n(px)} ({pct} {s['session']})"
+                                 + (f" · أمرك عند {_n(entry)} لن يُنفَّذ" if entry else "")))
     elif chg >= WATCH["up_early_pct"] and s["session"] != "الجلسة":
-        hits.append(("early", f"⚡ {sym} حركة {s['session']} {tail}\n   {kind} — قد يسبق خبراً. راقب، لا مطاردة."))
+        hits.append(("early", rank, f"{who} {_n(px)} ({pct} {s['session']}) · حجم {int(s['vol']):,}"))
     al = v.get("alert")
-    if not entry and al and px < al and not lvl:
-        hits.append(("alert", f"📉 {sym} كسر مستوى التنبيه {al} {tail}\n   {kind} — إن عاد فوق {al} فهو سحب واسترداد (سيصلك 🌀)."))
+    if not entry and al and px < al and not lvl and ref >= al:
+        hits.append(("alert", rank, f"{who} {_n(px)} ({pct}): المستوى {_n(al)}"))
     return s["date"], hits
 
 
@@ -516,7 +575,7 @@ def _watch_run():
         co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
         co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
         futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
-        msgs, nodata, limited = [], 0, 0
+        found, keys, nodata, limited = {}, [], 0, 0
         for s, f in futs.items():
             try:
                 d, hits = f.result(timeout=60)
@@ -526,24 +585,28 @@ def _watch_run():
                 limited += 1; continue
             if d is None:
                 nodata += 1; continue
-            for k, line in hits:
+            for k, rank, line in hits:
                 key = f"{d}:{s}:{k}"
                 with _watch_lock:
-                    if key in _watch_sent:
+                    if key in _watch_sent:             # كل نوع مرة واحدة لكل سهم في اليوم
                         continue
-                    if len(_watch_sent) > 5000:
-                        _watch_sent.clear()
+                found.setdefault(k, []).append((rank, s, line))
+                keys.append(key)
+        # v1.13: رسالة واحدة للجولة مجمّعة حسب النوع. لا يُعلَّم التنبيه «مُرسلاً» إلا إذا قبله تيليجرام، فيُعاد في الجولة التالية
+        sent_ok = all([_tg(m) for m in _watch_digest(found)]) if keys else None
+        if sent_ok:
+            with _watch_lock:
+                if len(_watch_sent) > 5000:
+                    _watch_sent.clear()
+                for key in keys:
                     _watch_sent[key] = 1
-                msgs.append(line)
-        if msgs:
-            for i in range(0, len(msgs), 8):
-                _tg("👁️ مراقبة القائمة (كل 5 دقائق)\n" + "\n".join(msgs[i:i + 8]))
+        msgs = keys
         # حماية عنوان الخادم: إن رفضت Yahoo كثيراً (429) نهدأ 15 دقيقة — الرادار يستخدم البروكسي نفسه
         if limited >= max(5, len(co) // 10):
             st["cooldown_until"] = time.time() + 900
             print(f"[watch] ⚠️ Yahoo رفضت {limited} طلباً (429) — تهدئة 15 دقيقة")
         st.update({"checked": len(co), "alerts": len(msgs), "nodata": nodata, "limited_429": limited, "error": None,
-                   "list_date": data.get("date")})
+                   "list_date": data.get("date"), "telegram_ok": sent_ok})
         print(f"[watch] فُحص {len(co)} · تنبيهات {len(msgs)} · بلا بيانات {nodata}")
     except Exception as e:
         st["error"] = str(e); print(f"[watch] خطأ: {e}")
