@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.17)
+Server — Yahoo Finance API Proxy (v1.17.1)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -23,6 +23,7 @@ Server — Yahoo Finance API Proxy (v1.17)
          · 🩳 بلغ هدف هبوط الشورت (فيصل: «لكل ألف شورت 1–2%») — من الرادار، متابعة الثبات لا دخول
 - v1.17: أهدأ — الفحص كل 5 دقائق كما هو، لكن الرسالة الفورية **بصوت** لما يحتاج قراراً فقط: 🛡️ هبوط على سهم عليه أمر،
          و🌀 و🎯 لـ✅ و👀. البقية (🚀 ⚡ 📉 🧱 🩳 ولـ👁️) تُجمع في **ملخص صامت كل 30 دقيقة** بوقت كل حدث (WATCH_DIGEST_MIN)
+- v1.17.1: قيمة WATCH_DIGEST_MIN الخاطئة («60 دقيقة» أو فارغة) لا توقف الخادم أبداً — يُقرأ أول رقم (5–240) وإلا 30
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -31,7 +32,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.17.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.17.1")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -359,13 +360,33 @@ def ibkr_borrow(symbols: str = Query(..., description="رموز مفصولة ب�
 # =====================================================================
 from datetime import datetime, timedelta, timezone
 
+
+def _env_min(name, default, lo=5.0, hi=240.0):
+    """v1.17.1: دقائق من متغير بيئة بلا أي خطر على التشغيل — «60» أو «60 دقيقة» أو «٦٠» ← 60؛ فارغ أو خطأ ← الافتراضي"""
+    import re
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        m = re.search(r"\d+(?:[.,]\d+)?", raw)
+        v = float(m.group(0).replace(",", ".")) if m else None
+    except Exception:
+        v = None
+    if v is None:
+        print(f"[watch] {name}={raw!r} ليست رقماً — نستخدم {default:g}")
+        return default
+    if not lo <= v <= hi:
+        print(f"[watch] {name}={v:g} خارج {lo:g}–{hi:g} — نستخدم {min(max(v, lo), hi):g}")
+    return min(max(v, lo), hi)
+
+
 WATCH = {"up_early_pct": 7.0,     # ⚡ حركة مبكرة (قبل الافتتاح/بعد الإغلاق) — احتمال تسريب قبل الخبر
          "up_pct": 15.0,          # 🚀
          "drop_pct": 8.0,         # 🛡️ لسهم عليه أمر
          "sweep_min_pct": 10.0,   # 🌀 سحب فيصل: نزول 10–15% تحت الدعم ثم عودة فوقه («سبرنت داون 10% > 15%» — v1.14؛ كان 4%)
          "sweep_max_pct": 15.0,   #    أعمق من ذلك = كسر لا سحب
          "max_symbols": 120,
-         "digest_min": float(os.environ.get("WATCH_DIGEST_MIN", "30"))}   # v1.17: الملخص الصامت كل 30 دقيقة
+         "digest_min": _env_min("WATCH_DIGEST_MIN", 30.0)}   # v1.17: الملخص الصامت كل 30 دقيقة (v1.17.1: قراءة آمنة)
 _watch_sent = {}                  # {"YYYY-MM-DD:SYM:kind": 1} — يُصفَّر يومياً
 _watch_buf = {}                   # v1.17: {المفتاح: (النوع، الرتبة، الرمز، السطر)} — بانتظار الملخص الصامت
 _watch_flush = {"at": 0.0}
