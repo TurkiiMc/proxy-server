@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.17.1)
+Server — Yahoo Finance API Proxy (v1.18)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -24,6 +24,14 @@ Server — Yahoo Finance API Proxy (v1.17.1)
 - v1.17: أهدأ — الفحص كل 5 دقائق كما هو، لكن الرسالة الفورية **بصوت** لما يحتاج قراراً فقط: 🛡️ هبوط على سهم عليه أمر،
          و🌀 و🎯 لـ✅ و👀. البقية (🚀 ⚡ 📉 🧱 🩳 ولـ👁️) تُجمع في **ملخص صامت كل 30 دقيقة** بوقت كل حدث (WATCH_DIGEST_MIN)
 - v1.17.1: قيمة WATCH_DIGEST_MIN الخاطئة («60 دقيقة» أو فارغة) لا توقف الخادم أبداً — يُقرأ أول رقم (5–240) وإلا 30
+- v1.18 (YYAI وANPA، 15-10):
+         · لا تكرار: الخادم يعمل بعاملين، وكان لكل عامل ذاكرته (🎯 YYAI وصل مرتين، و🌀 AGRZ في ملخصين بينهما 15 دقيقة).
+           الآن جولة واحدة في كل الخادم (قفل ملف)، وما أُرسل وما ينتظر الملخص في ملف مشترك (WATCH_STATE_FILE)
+         · 💰 فوري بصوت لـ✅ و👀: بلغ الهدف الأول وأمر (أ) نُفّذ غالباً (لمس السعر الأمر اليوم أو في آخر 5 جلسات) — بدل «لا تطارد»
+         · 🎯 حسب الأمر: «في منطقة أوامرك · Limit نُفّذ/قد يُنفَّذ · الوقف»، وبلا أمر: «التأكيد: إغلاق 4H فوق قمة شمعة الاختبار»
+         · 🌀 استرداد بعد سحب الأمس (فيصل، ANPA: «الأصل ثبات 1.85 · سحب سيولة إلى 1.60») — خلال جلستين، فوري بصوت
+         · 🔓 تجاوز سقف الموجات الهابطة (أعلى 15 جلسة، يكتبه الرادار) — «الموجات الهابطة 2.20 لازم يتحرر منها»
+         · الملخص الصامت يُرسل قبل نهاية النافذة (19:45 نيويورك) فلا يبيت إلى الغد
 - تسجيل كل فشل في السجلات (لا أخطاء صامتة)
 """
 import os, time, threading
@@ -32,7 +40,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.17.1")
+app = FastAPI(title="Faisal Proxy Server", version="1.18.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -393,6 +401,89 @@ _watch_flush = {"at": 0.0}
 _watch_lock = threading.Lock()
 _watch_last = {"at": None, "checked": 0, "alerts": 0, "nodata": 0, "error": None, "running": False}
 
+# ---- v1.18: ذاكرة مشتركة بين عاملَي uvicorn (--workers 2) — لكل عامل ذاكرته، فكان التنبيه يصل مرتين ----
+import json as _json
+from contextlib import contextmanager
+try:
+    import fcntl
+except Exception:                                   # ويندوز للتجربة المحلية فقط — Render لينكس
+    fcntl = None
+
+
+def _state_path():
+    return os.environ.get("WATCH_STATE_FILE") or "/tmp/faisal_watch_state.json"
+
+
+def _state_load():
+    try:
+        with open(_state_path(), encoding="utf-8") as f:
+            return _json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _state_merge():
+    """يدمج الملف المشترك في ذاكرة هذا العامل: ما أرسله أي عامل يُعدّ مُرسلاً، وما ينتظر الملخص ينتظر عند الجميع"""
+    st = _state_load()
+    with _watch_lock:
+        for k in (st.get("sent") or {}):
+            _watch_sent[k] = 1
+        for k, v in (st.get("buf") or {}).items():
+            if k not in _watch_sent and k not in _watch_buf and isinstance(v, (list, tuple)) and len(v) == 4:
+                _watch_buf[k] = tuple(v)
+        for k in [k for k in _watch_buf if k in _watch_sent]:
+            _watch_buf.pop(k, None)
+        _watch_flush["at"] = max(float(_watch_flush.get("at") or 0), float(st.get("flush_at") or 0))
+
+
+def _state_save():
+    """يكتب الذاكرة في الملف (كتابة ذرّية) — يبقي مفاتيح آخر 4 أيام فقط"""
+    with _watch_lock:
+        days = sorted({k[:10] for k in _watch_sent})
+        keep = set(days[-4:])
+        for k in [k for k in _watch_sent if k[:10] not in keep]:
+            _watch_sent.pop(k, None)
+        data = {"sent": dict(_watch_sent), "buf": {k: list(v) for k, v in _watch_buf.items()},
+                "flush_at": _watch_flush.get("at") or 0, "last": {k: v for k, v in _watch_last.items() if k != "running"}}
+    path = _state_path()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+@contextmanager
+def _run_lock():
+    """جولة واحدة في كل الخادم: قفل ملف غير حاجز — العامل الثاني يتخطى الجولة بدل أن يكررها"""
+    if fcntl is None:
+        yield True
+        return
+    fd = open(_state_path() + ".lock", "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+
+def _last_view():
+    """حالة آخر جولة لأي عامل (الأحدث بين ذاكرة هذا العامل والملف المشترك)"""
+    try:
+        fl = _state_load().get("last") or {}
+        if str(fl.get("at") or "") > str(_watch_last.get("at") or ""):
+            return {**fl, "running": _watch_last.get("running", False)}
+    except Exception:
+        pass
+    return _watch_last
+
 
 def _ny_now(ts=None):
     """توقيت نيويورك بلا اعتماد على قاعدة المناطق (التوقيت الصيفي: الأحد الثاني من مارس → الأحد الأول من نوفمبر)"""
@@ -431,13 +522,15 @@ def _n(x):
 
 RLM = "‏"                     # يبدأ به كل سطر ليُعرض من اليمين لليسار في تيليجرام ولو بدأ برمز لاتيني
 # v1.16: ترتيب الأحداث في رسالة الجولة — كل سطر يبدأ برمزه (لا عناوين)، والأهم أولاً
-WATCH_ORDER = ["reclaim", "down", "up", "early", "zone", "short", "break", "alert"]
+WATCH_ORDER = ["take", "reclaim2", "reclaim", "down", "release_sw", "release", "up", "early", "zone", "short", "break", "alert"]
 _TIER_RANK = {"✅": 0, "👀": 1, "👁️": 2}
 
 
 def _urgent(k, rank):
-    """v1.17: ما يحتاج قراراً الآن يصل فوراً بصوت — 🛡️ هبوط على سهم عليه أمر، و🌀 و🎯 لـ✅ و👀. الباقي للملخص الصامت"""
-    return k == "down" or (k in ("reclaim", "zone") and rank <= 1)
+    """v1.17: ما يحتاج قراراً الآن يصل فوراً بصوت — 🛡️ هبوط على سهم عليه أمر، و🌀 و🎯 لـ✅ و👀. الباقي للملخص الصامت
+    v1.18: 💰 بلغ الهدف وأمرك نُفّذ · 🌀 استرداد بعد سحب الأمس (أي فئة — قرار فيصل) · 🔓 لـ✅ و👀، أو بعد سحب معلّق"""
+    return (k in ("down", "take", "reclaim2", "release_sw")
+            or (k in ("reclaim", "zone", "release") and rank <= 1))
 
 
 def _watch_digest(found, title=None):
@@ -501,6 +594,7 @@ def _sessions(result):
         return None
     ref = [b for b in reg if b["d"] == ref_d][-1]["c"]
     day = [b for b in bars if b["d"] == today and 240 <= b["m"] < 1200]
+    day_all = day or [last]                              # v1.18: اليوم كله (قبل الافتتاح + الجلسة + بعد الإغلاق)
     if session == "بعد الإغلاق":
         day = [b for b in day if b["m"] >= 960]          # قاع ما بعد الإغلاق فقط (لا قاع الجلسة)
     a, z = PERIODS[session]
@@ -508,7 +602,8 @@ def _sessions(result):
     top = max(seg, key=lambda b: b["h"])                 # أعلى سعر في الفترة الحالية، ولو عاد السعر بعده
     return {"session": session, "px": last["c"], "ref": ref, "chg": (last["c"] / ref - 1) * 100,
             "low": min(b["l"] for b in day), "vol": sum(b["v"] for b in day), "date": str(today),
-            "high": top["h"], "high_vol": top["v"]}
+            "high": top["h"], "high_vol": top["v"],
+            "day_low": min(b["l"] for b in day_all), "day_high": max(b["h"] for b in day_all)}
 
 
 # ---- v1.9: Massive (Polygon سابقاً) بديلاً حين لا تُظهر Yahoo صفقات اليوم ----
@@ -562,6 +657,14 @@ def _watch_one(sym, v):
         return None, []
     px, chg, low, ref = s["px"], s["chg"], s["low"], s["ref"]
     entry, stop = v.get("entry"), v.get("stop")
+    per = s["session"]
+    day_lo = float(s.get("day_low") if s.get("day_low") is not None else low)      # v1.18: قاع اليوم كله
+    hi = max(float(s.get("high") or px), px)                                        # أعلى سعر في الفترة الحالية
+    day_hi = max(float(s.get("day_high") or 0), hi)                                 # v1.18: أعلى سعر في اليوم كله
+    tg = [float(t) for t in (v.get("targets") or []) if t]
+    # v1.18 (YYAI): أمر (أ) نُفّذ غالباً إن لمسه السعر اليوم أو في آخر 5 جلسات (يكتبه الرادار «touched»)
+    filled = (bool(entry) and (bool(v.get("touched")) or day_lo <= float(entry))
+              and not (stop and day_lo <= float(stop)))                     # ضرب الوقف اليوم ⇒ خرج المركز غالباً
     tier = (v.get("kinds") or [""])[0]
     icon = tier.split()[0] if tier.strip() else ""
     actionable = ("جاهز" in tier) or ("قريب" in tier)          # «جاهز» و«قريب» — عليهما أوامر في منطقة الاختبار
@@ -585,15 +688,19 @@ def _watch_one(sym, v):
     zn = v.get("zone") or []
     if (actionable and len(zn) == 2 and zn[0] and zn[1] and not lvl
             and zn[0] <= low <= zn[1] and px >= zn[0] and ref > zn[1]):
-        hits.append(("zone", rank, f"🎯 {who} {_n(px)} · دخل المنطقة {_n(zn[0])}–{_n(zn[1])} · انتظر إغلاقاً فوق قمة الاختبار"))
+        if entry:                                   # v1.18: أوامر (أ) في المنطقة — الدخول هو التنفيذ، لا انتظار تأكيد
+            hits.append(("zone", rank, f"🎯 {who} {_n(px)} · في منطقة أوامرك {_n(zn[0])}–{_n(zn[1])} · Limit {_n(entry)} "
+                                       + ("نُفّذ غالباً" if day_lo <= float(entry) else "قد يُنفَّذ")
+                                       + (f" · الوقف {_n(stop)}" if stop else "")))
+        else:                                       # بلا أمر: التأكيد عند فيصل = إغلاق 4H فوق قمة شمعة الاختبار
+            hits.append(("zone", rank, f"🎯 {who} {_n(px)} · يختبر المنطقة {_n(zn[0])}–{_n(zn[1])} · "
+                                       "التأكيد: إغلاق 4H فوق قمة شمعة الاختبار"))
     if entry and chg <= -WATCH["drop_pct"]:
         hits.append(("down", rank, f"🛡️ {who} {_n(px)} ({pct}) · أمرك {_n(entry)}"
                                    + (f" · ⛔ تحت الوقف {_n(stop)}" if stop and px <= stop else " · قد يُنفَّذ")
                                    + " · راجع الخبر أو ألغِ"))
     # v1.15: 🚀 و⚡ على أعلى سعر في الفترة، لا آخر سعر فقط — القفزة التي تصعد وتعود بين فحصين لا تفوت
     # (SMTK بعد الإغلاق: 1.63 ثم 1.07 خلال دقائق، والفحص التالي رأى 1.07 فقط)
-    per = s["session"]
-    hi = max(float(s.get("high") or px), px)
     hchg = (hi / ref - 1) * 100 if ref else chg
 
     def _spike(th):
@@ -603,9 +710,21 @@ def _watch_one(sym, v):
         return (f" · لمس {_n(hi)} ({hchg:+.0f}%) ثم {'عاد' if chg < th else 'تراجع'}"
                 + (f" بحجم {hv:,}" if hv else ""))
 
-    if hchg >= WATCH["up_pct"]:
+    # v1.18 (YYAI بعد الإغلاق +37%): بلغ الهدف الأول وأمرك نُفّذ غالباً ⇒ 💰 فوري بصوت، لا «لا تطارد» في ملخص صامت
+    took = bool(filled and tg and rank <= 1 and day_hi >= tg[0])
+    if took:
+        got = [t for t in tg if day_hi >= t]
+        hits.append(("take", rank, f"💰 {who} {_n(px)} · بلغ " + ("أهداف البيع " if len(got) > 1 else "الهدف الأول ")
+                                   + " · ".join(_n(t) for t in got)
+                                   + (f" (أعلى {_n(day_hi)})" if day_hi > got[-1] * 1.02 else "")
+                                   + f" · أمرك {_n(entry)} نُفّذ غالباً — بِع حسب الخطة"
+                                   + (f" · {per}: أمر Limit خارج الجلسة" if per != "الجلسة" else "")))
+    if took:
+        pass                                        # 💰 يغني عن 🚀 و⚡ للسهم نفسه
+    elif hchg >= WATCH["up_pct"]:
         hits.append(("up", rank, f"🚀 {who} {_n(px)} ({pct} {per}){_spike(WATCH['up_pct'])}"
-                                 + (f" · أمرك {_n(entry)} لن يُنفَّذ" if entry and px > entry * 1.05 else "") + " · لا تطارد"))
+                                 + (f" · أمرك {_n(entry)} نُفّذ غالباً · لا تزد" if filled else
+                                    (f" · أمرك {_n(entry)} لن يُنفَّذ" if entry and px > entry * 1.05 else "") + " · لا تطارد")))
         dkeys["up"] = f"up@{per}"
     elif hchg >= WATCH["up_early_pct"] and per != "الجلسة":
         hits.append(("early", rank, f"⚡ {who} {_n(px)} ({pct} {per}){_spike(WATCH['up_early_pct'])} · حجم {int(s['vol']):,}"
@@ -614,6 +733,20 @@ def _watch_one(sym, v):
     al = v.get("alert")
     if not entry and al and px < al and not lvl and ref >= al:
         hits.append(("alert", rank, f"📉 {who} {_n(px)} ({pct}) · تحت مستوى التنبيه {_n(al)} · راقب"))
+    # v1.18 (فيصل، ANPA): سحب 10–15% تحت الأصل أمس ولم يُسترد ⇒ العودة فوق الأصل خلال جلستين = «هنا تقرر دخولك»
+    sw = v.get("sweep") or {}
+    if (sw.get("base") and sw.get("low") and not lvl
+            and str(sw.get("date") or "") < s["date"] <= str(sw.get("until") or "")
+            and px > float(sw["base"]) >= ref and day_lo > float(sw["low"]) * 0.99):
+        hits.append(("reclaim2", rank, f"🌀 {who} {_n(px)} · استرد {_n(sw['base'])} بعد سحب {_n(sw['low'])} ({_dm(sw['date'])}) · "
+                                       f"Limit {_n(sw['base'])}، الوقف تحت {_n(sw['low'])}"))
+    # v1.18 (فيصل، ANPA): «الموجات الهابطة 2.20 لازم يتحرر منها» — أول تجاوز اليوم لسقف آخر 15 جلسة (يكتبه الرادار)
+    rel = float(v.get("release") or 0)
+    if rel and not took and ref < rel <= day_hi:
+        hits.append(("release_sw" if sw.get("base") else "release", rank,
+                     f"🔓 {who} {_n(px)} · " + (f"تجاوز سقف الموجات الهابطة {_n(rel)}" if px >= rel
+                                                 else f"لمس سقف الموجات الهابطة {_n(rel)} ثم عاد")
+                     + " · التحرر بإغلاق يومي فوقه"))
     # v1.16 (فيصل، BRTX): 🩳 بلغ هدف هبوط الشورت اليوم — «تم الهبوط، متابعة مبكرة للثبات، لا يوجد دخول آمن»
     stt = v.get("short_target") or []
     if len(stt) == 2 and stt[0] and low <= stt[0] < ref:
@@ -624,6 +757,25 @@ def _watch_one(sym, v):
 
 
 def _watch_run():
+    """v1.18: جولة واحدة في كل الخادم (قفل ملف بين العاملين)، والذاكرة المشتركة تُدمج قبلها وتُحفظ بعدها"""
+    with _run_lock() as got:
+        if not got:                                 # عامل آخر يفحص الآن — لا تكرار للجولة نفسها
+            _watch_last["running"] = False
+            return
+        try:
+            _state_merge()
+        except Exception as e:
+            print(f"[watch] تعذّر قراءة الذاكرة المشتركة: {e}")
+        try:
+            _watch_run_inner()
+        finally:
+            try:
+                _state_save()
+            except Exception as e:
+                print(f"[watch] تعذّر حفظ الذاكرة المشتركة: {e}")
+
+
+def _watch_run_inner():
     st = _watch_last
     try:
         url = os.environ.get("COILED_URL")
@@ -688,8 +840,13 @@ def _watch_flush_due(now_t=None):
     """v1.17: الملخص الصامت — كل digest_min دقيقة إن وُجد ما ينتظر. يعيد عدد الأسطر المرسلة (0 إن لم يحن)"""
     now_t = now_t or time.time()
     with _watch_lock:
+        newest = max((k[:10] for k in _watch_buf), default="")
+        for k in [k for k in _watch_buf if k[:10] < newest]:     # v1.18: سطر من يوم سابق بات في الانتظار ← لا يُرسل متأخراً
+            _watch_buf.pop(k, None)
         items = dict(_watch_buf)
-    if not items or now_t - _watch_flush["at"] < WATCH["digest_min"] * 60:
+    ny = _ny_now(now_t)
+    closing = 19 * 60 + 45 <= ny.hour * 60 + ny.minute < 20 * 60   # v1.18: آخر جولات النافذة — لا يبيت الملخص إلى الغد
+    if not items or (now_t - _watch_flush["at"] < WATCH["digest_min"] * 60 and not closing):
         return 0
     found = {}
     for k, rank, s, line in items.values():
@@ -702,6 +859,14 @@ def _watch_flush_due(now_t=None):
             _watch_sent[key] = 1
     _watch_flush["at"] = now_t
     return len(items)
+
+
+def _dm(d):
+    """«2026-10-14» ← «14/10»"""
+    try:
+        return f"{int(str(d)[8:10])}/{int(str(d)[5:7])}"
+    except Exception:
+        return str(d)
 
 
 def _riyadh(t):
@@ -899,11 +1064,11 @@ def watch(key: str = Query("", description="WATCH_KEY إن ضُبط")):
     ny = _ny_now()
     m = ny.hour * 60 + ny.minute
     if ny.weekday() >= 5 or not (240 <= m < 1200):
-        return {"ok": True, "skipped": "خارج 4:00–20:00 نيويورك", "last": _watch_last}
+        return {"ok": True, "skipped": "خارج 4:00–20:00 نيويورك", "last": _last_view()}
     if _watch_last["running"]:
-        return {"ok": True, "busy": True, "last": _watch_last}
-    if time.time() < (_watch_last.get("cooldown_until") or 0):
-        return {"ok": True, "cooldown": "تهدئة بعد رفض Yahoo (429)", "last": _watch_last}
+        return {"ok": True, "busy": True, "last": _last_view()}
+    if time.time() < (_last_view().get("cooldown_until") or 0):
+        return {"ok": True, "cooldown": "تهدئة بعد رفض Yahoo (429)", "last": _last_view()}
     _watch_last["running"] = True
     threading.Thread(target=_watch_run, daemon=True).start()
     return {"ok": True, "started": True, "last": _watch_last}
