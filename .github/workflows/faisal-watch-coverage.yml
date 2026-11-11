@@ -1,0 +1,150 @@
+# In TurkiiMc/proxy-server: .github/workflows/faisal-watch-coverage.yml
+# Monitor ready/near each round and rotate early-only list; no signal criteria changes.
+name: Faisal - watchlist coverage rotation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preview first; apply only after a green run"
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: faisal-proxy-patch
+  cancel-in-progress: false
+
+jobs:
+  validate-and-patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout proxy-server main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TurkiiMc/proxy-server"
+          test "$GITHUB_REF_NAME" = "main"
+          test -f app.py
+          grep -q '_watch_run_inner' app.py
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Stage coverage selection patch (not committed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/rotate_patch.py <<'PY_PATCH'
+          """Patch only /watch watchlist selection; leave signal rules and message volume unchanged."""
+          from pathlib import Path
+          import ast
+          p=Path('app.py')
+          s=p.read_text(encoding='utf-8')
+          marker='FAISAL_WATCH_ROTATE_V1'
+          old='        co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])'
+          if marker in s:
+              print('Proxy selection already patched')
+          else:
+              assert s.count(old)==1, 'Unknown /watch selection code; stop rather than guessing'
+              fn='''# FAISAL_WATCH_ROTATE_V1 — watch ready/near every round; rotate early-only coverage.
+          # This is a coverage/scheduling change only. Trading criteria and alert urgency are unchanged.
+          def _select_watch_symbols(watch, cap, epoch_slot):
+              def tier(item):
+                  kinds = item[1].get('kinds') or []
+                  desc = str(kinds[0]) if kinds else ''
+                  return 0 if 'جاهز' in desc else (1 if 'قريب' in desc else 2)
+
+              ranked = sorted(watch.items(), key=lambda item: (tier(item),
+                  -float(item[1].get('score') or 0), item[0]))
+              core = [item for item in ranked if tier(item) <= 1]
+              early = [item for item in ranked if tier(item) > 1]
+              if len(core) >= cap:
+                  return dict(core[:cap])
+              slots = cap - len(core)
+              if len(early) <= slots:
+                  return dict(core + early)
+              # Consecutive polling slots walk the whole early pool without relying on
+              # persistent memory (works across two Render worker processes).
+              offset = (int(epoch_slot) * slots) % len(early)
+              chosen = [early[(offset + j) % len(early)] for j in range(slots)]
+              return dict(core + chosen)
+
+
+          '''
+              s=s.replace('def _watch_run_inner():',fn+'def _watch_run_inner():',1)
+              s=s.replace(old,'        co = _select_watch_symbols(co, WATCH["max_symbols"], int(time.time() // 300))',1)
+              ast.parse(s,filename='app.py')
+              p.write_text(s,encoding='utf-8')
+              print('Patched app.py with rotating early watch coverage')
+          PY_PATCH
+          python /tmp/rotate_patch.py
+          python -m py_compile app.py
+          git diff --check
+          git diff --stat
+      - name: Test complete 206-symbol coverage with 120 cap
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/test_rotate.py <<'PY_TEST'
+          import ast
+          from pathlib import Path
+          code=Path('app.py').read_text(encoding='utf-8')
+          tree=ast.parse(code)
+          node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_select_watch_symbols')
+          space={}
+          exec(compile(ast.Module(body=[node], type_ignores=[]), 'selection-test','exec'),space)
+          select=space['_select_watch_symbols']
+          symbols={f'N{i:03d}':{'kinds':['👀 قريب'],'score':i} for i in range(35)}
+          symbols.update({f'E{i:03d}':{'kinds':['👁️ مراقبة مبكرة'],'score':i} for i in range(171)})
+          base=12345
+          picks=[set(select(symbols,120,base+i)) for i in range(3)]
+          assert all(len(p)==120 for p in picks), [len(p) for p in picks]
+          assert all({f'N{i:03d}' for i in range(35)} <= p for p in picks)
+          assert set.union(*picks)==set(symbols), len(set.union(*picks))
+          assert set(select(symbols,120,base))==set(select(symbols,120,base))
+          assert len(select(symbols,300,base))==206
+          assert 'WATCH["max_symbols"]' in code
+          print('ROTATION_TEST_OK: 206/206 covered within 3 rounds; near always checked; max 120/round')
+          PY_TEST
+          python /tmp/test_rotate.py
+      - name: Upload diff preview
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/proxy-rotation-preview
+          git diff -- app.py > /tmp/proxy-rotation-preview/change.patch || true
+      - name: Save diff artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-watch-coverage-preview
+          path: /tmp/proxy-rotation-preview/
+      - name: Apply after preview review
+        if: ${{ success() && inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "faisal-watch-bot"
+          git config user.email "faisal-watch-bot@users.noreply.github.com"
+          git add -- app.py
+          if git diff --cached --quiet; then
+            echo "Already updated"
+            exit 0
+          fi
+          git commit -m "fix: rotate early-watch coverage while prioritizing ready and near"
+          git push origin HEAD:main
+      - name: Preview completion
+        if: ${{ success() && inputs.mode == 'preview' }}
+        run: echo "Preview only. After screener exporter is fresh, apply this to allow Render auto-deploy."
