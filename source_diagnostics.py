@@ -7,7 +7,8 @@ import os
 import time
 import threading
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from collections import Counter
 
 import requests
@@ -98,7 +99,7 @@ def _alpaca_latest(symbols, now=None):
     key = os.environ.get('APCA_API_KEY_ID') or os.environ.get('ALPACA_API_KEY_ID')
     secret = os.environ.get('APCA_API_SECRET_KEY') or os.environ.get('ALPACA_API_SECRET_KEY')
     if not key or not secret:
-        return 'missing_credentials', {}
+        return 'missing_credentials', {}, {}
     try:
         resp = requests.get(
             'https://data.alpaca.markets/v2/stocks/bars/latest',
@@ -107,42 +108,82 @@ def _alpaca_latest(symbols, now=None):
             timeout=12,
         )
         if resp.status_code != 200:
-            return f'http_{resp.status_code}', {}
+            return f'http_{resp.status_code}', {}, {}
         bars = (resp.json() or {}).get('bars') or {}
         if not isinstance(bars, dict):
-            return 'bad_response', {}
-        return 'ok', {s: _label_age((bars.get(s) or {}).get('t'), now) for s in symbols}
+            return 'bad_response', {}, {}
+        return ('ok',
+                {s: _label_age((bars.get(s) or {}).get('t'), now) for s in symbols},
+                {s: _latest_age((bars.get(s) or {}).get('t'), now) for s in symbols})
     except Exception as exc:
-        return f'network_{type(exc).__name__}', {}
+        return f'network_{type(exc).__name__}', {}, {}
+
+
+# FAISAL_MASSIVE_HTTP_AGE_DIAG_V2: diagnostic-only Massive request.
+# No changes to _massive_result used by live /watch, no Telegram, no key logging.
+def _age_text(age):
+    return 'na' if age is None else f'{age:.1f}'
+
+
+def _massive_probe(sym, now):
+    key = os.environ.get('MASSIVE_API_KEY')
+    if not key:
+        return 'not_configured', None
+    try:
+        day = datetime.fromtimestamp(now, ZoneInfo('America/New_York')).date()
+        start_day = str(day - timedelta(days=5))
+        # Mirror app.py original parameters; only the diagnostic result is logged.
+        resp = requests.get(
+            f'https://api.massive.com/v2/aggs/ticker/{sym.replace(".", "-")}/range/5/minute/{start_day}/{day}',
+            params={'adjusted': 'true', 'sort': 'asc', 'limit': 5000, 'apiKey': key},
+            timeout=12,
+        )
+        code = int(resp.status_code)
+        if code != 200:
+            return f'http_{code}', None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return 'http_200_invalid_json', None
+        rows = data.get('results') or []
+        if not isinstance(rows, list):
+            return 'http_200_invalid_rows', None
+        if not rows:
+            return 'http_200_no_bars', None
+        ts_ms = rows[-1].get('t') if isinstance(rows[-1], dict) else None
+        age = _latest_age(float(ts_ms) / 1000 if ts_ms is not None else None, now)
+        if age is None:
+            return 'http_200_invalid_timestamp', None
+        return f'http_200_{_label_age(float(ts_ms) / 1000, now)}', age
+    except requests.RequestException as exc:
+        return f'network_{type(exc).__name__}', None
+    except Exception as exc:
+        return f'parse_{type(exc).__name__}', None
 
 
 def _run_sample(symbols, originally_missing, chart, massive, sessions, fresh):
     start = time.time()
     now = time.time()
-    iex_request, iex_results = _alpaca_latest(symbols, now)
+    iex_request, iex_results, iex_ages = _alpaca_latest(symbols, now)
     counts = {'yahoo': Counter(), 'massive': Counter(), 'iex': Counter()}
     rescued = []
     for sym in symbols:
         try:
             y, err = chart(sym, '2d', '5m', True)
             ystate = _status_session(y, err, sessions, fresh)
+            yage = _latest_age((y.get('timestamp') or [None])[-1], now) if y else None
         except Exception:
-            ystate = 'exception'
-        if not os.environ.get('MASSIVE_API_KEY'):
-            mstate = 'not_configured'
-        else:
-            try:
-                m = massive(sym)
-                mstate = _status_session(m, None, sessions, fresh)
-            except Exception:
-                mstate = 'exception'
+            ystate, yage = 'exception', None
+        # Separate read-only diagnostic probe: preserves original /watch Massive fallback.
+        mstate, mage = _massive_probe(sym, now)
         istate = iex_results.get(sym, 'missing') if iex_request == 'ok' else iex_request
         for src, status in [('yahoo', ystate), ('massive', mstate), ('iex', istate)]:
             counts[src][status] += 1
         if sym in originally_missing and istate == 'fresh':
             rescued.append(sym)
         print(f'[source-diag] {sym} watch_missing={int(sym in originally_missing)} '
-              f'yahoo={ystate} massive={mstate} iex={istate}')
+              f'yahoo={ystate} yahoo_age_min={_age_text(yage)} '
+              f'massive={mstate} massive_age_min={_age_text(mage)} '
+              f'iex={istate} iex_age_min={_age_text(iex_ages.get(sym))}')
     def fmt(c):
         return ','.join(f'{k}:{c[k]}' for k in sorted(c)) or 'none'
     print(f'[source-diag] summary n={len(symbols)} originally_missing={len(originally_missing & set(symbols))} '
