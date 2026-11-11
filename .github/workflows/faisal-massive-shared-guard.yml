@@ -18,8 +18,10 @@ on:
 permissions:
   contents: write
 
+# Separate this repair from a previously stuck GitHub Actions concurrency group.
+# Preview and apply remain mutually exclusive within this workflow.
 concurrency:
-  group: faisal-proxy-patch
+  group: faisal-massive-guard-recovery-v2-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
