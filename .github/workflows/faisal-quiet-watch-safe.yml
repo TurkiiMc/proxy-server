@@ -1,0 +1,402 @@
+# GitHub Actions: TurkiiMc/proxy-server/.github/workflows/faisal-quiet-watch.yml
+# Preview first. Safe detection: supports app.py or server.py ONLY when it matches v1.18.
+# This workflow is never scheduled; apply requires an explicit action.
+name: Faisal Quiet Watch v1.19 (reviewed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preview = test only; apply = commit and let Render redeploy"
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+jobs:
+  quiet-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout proxy-server
+        uses: actions/checkout@v4
+      - name: Locate active v1.18 application safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          matches=()
+          for f in app.py server.py; do
+            if test -f "$f" && grep -q 'version="1.18.0"' "$f" && grep -q 'def _watch_flush_due(' "$f" && grep -q '@app.get("/watch")' "$f"; then
+              matches+=("$f")
+            fi
+          done
+          if [ "${#matches[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one matching v1.18 watch server in app.py or server.py; got ${#matches[@]}. Nothing changed."
+            exit 1
+          fi
+          echo "WATCH_TARGET=${matches[0]}" >> "$GITHUB_ENV"
+          mkdir -p original
+          cp -- "${matches[0]}" "original/${matches[0]}"
+          echo "Preview target: ${matches[0]}"
+      - name: Prepare quiet watch update
+        run: |
+          python - <<'PY_PATCH'
+          #!/usr/bin/env python3
+          """Patch proxy-server v1.18 to conservative notification policy v1.19.
+          
+          Requires exact anchors; fails closed if source differs. Does not run server.
+          """
+          from pathlib import Path
+          import ast
+          import os
+          import sys
+
+          p=Path(os.environ['WATCH_TARGET'])
+          s=p.read_text(encoding='utf-8')
+          if 'version="1.19.0"' in s and '# FAISAL_QUIET_V119' in s:
+              print('Already patched: v1.19 (no changes)')
+              sys.exit(0)
+          if 'version="1.18.0"' not in s or 'def _watch_flush_due(' not in s:
+              raise SystemExit('Refusing patch: expected Faisal proxy-server v1.18')
+          
+          def once(old,new, tag):
+              global s
+              n=s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{tag}: expected exactly one anchor, found {n}')
+              s=s.replace(old,new,1)
+          
+          def block(start,end,new,tag):
+              global s
+              n=s.count(start)
+              if n != 1:
+                  raise RuntimeError(f'{tag}: expected one block start, got {n}')
+              a=s.index(start)
+              b=s.find(end,a+len(start))
+              if b == -1: raise RuntimeError(f'{tag}: block end not found')
+              s=s[:a]+new+s[b:]
+          
+          once('version="1.18.0"','version="1.19.0"','version')
+          # The existing version history stays intact; the new policy takes precedence.
+          once('Server — Yahoo Finance API Proxy (v1.18)', 'Server — Yahoo Finance API Proxy (v1.19 — quiet notifications)', 'doc heading')
+          once('"max_symbols": 120,','"max_symbols": 120,','max symbols unchanged')
+          once('WATCH_ORDER = ["take",','WATCH_ORDER = ["down_stop", "take",','watch order')
+          
+          block('def _urgent(k, rank):','def _watch_digest(','''def _urgent(k, rank):
+              """FAISAL_QUIET_V119: voice only for stop breach or ready setups.
+          
+              A near/early watchlist is not a validated order and never receives voice.
+              """
+              return k == "down_stop" or (rank == 0 and k in ("zone", "reclaim"))
+          
+          
+          ''','urgency')
+          
+          # Freshness check avoids rebroadcasting a stale last traded 5m candle.
+          once('bars.append({"d": ny.date(), "m": ny.hour * 60 + ny.minute, "c": c,',
+               'bars.append({"d": ny.date(), "t": int(t), "m": ny.hour * 60 + ny.minute, "c": c,','last bar time')
+          once('return {"session": session, "px": last["c"], "ref": ref,',
+               'return {"session": session, "last_ts": last["t"], "px": last["c"], "ref": ref,','session timestamp')
+          block('def _fresh(s):','def _watch_one(','''def _fresh(s):
+              """Only trade on today's bars not older than 20 minutes (5m polling)."""
+              if not s or s.get("date") != str(_ny_now().date()):
+                  return False
+              try:
+                  age = time.time() - float(s["last_ts"])
+                  return -60 <= age <= 20 * 60
+              except (ValueError, TypeError, KeyError):
+                  return False
+          
+          
+          ''','freshness')
+          
+          # Use historical price touches for context, NEVER for claims that orders executed.
+          once('filled = (bool(entry) and (bool(v.get("touched")) or day_lo <= float(entry))\n              and not (stop and day_lo <= float(stop)))',
+               'entry_touched = bool(entry) and (bool(v.get("touched")) or day_lo <= float(entry))',
+               'filled flag')
+          block('        if entry:                                   # v1.18: أوامر (أ) في المنطقة',
+                '        else:                                       # بلا أمر:',
+          '''        if entry:
+                      hits.append(("zone", rank, f"🎯 {who} {_n(px)} · اختبار منطقة {_n(zn[0])}–{_n(zn[1])}"
+                                                 + f" · مستوى Limit {_n(entry)} (التنفيذ غير مؤكد)"
+                                                 + (f" · وقف الخطة {_n(stop)}" if stop else "")))
+          ''','zone message')
+          block('    if entry and chg <= -WATCH["drop_pct"]:',
+                '    # v1.15: 🚀 و⚡',
+          '''    if entry and (chg <= -WATCH["drop_pct"] or (stop and px <= float(stop))):
+                  breached_stop = bool(stop and px <= float(stop))
+                  # A planned order is not a brokerage-confirmed position.
+                  position_confirmed = v.get("position_confirmed") is True
+                  kind = "down_stop" if breached_stop and position_confirmed else "down"
+                  hits.append((kind, rank,
+                               f"🛡️ {who} {_n(px)} ({pct}) · مستوى دخول الخطة {_n(entry)}"
+                               + (f" · تجاوز وقف الخطة {_n(stop)} · تحقق من مركزك" if breached_stop else
+                                  " · هبوط قوي، راجع خطتك (لا تأكيد على وجود أمر)")))
+          ''','risk message')
+          once('took = bool(filled and tg and rank <= 1 and day_hi >= tg[0])',
+               'took = bool(entry and tg and rank <= 1 and day_hi >= tg[0])',
+               'take condition')
+          block('    if took:\n        got = [t for t in tg if day_hi >= t]',
+                '    if took:\n        pass',
+          '''    if took:
+                  got = [t for t in tg if day_hi >= t]
+                  hits.append(("take", rank, f"💰 {who} {_n(px)} · لامس "
+                                             + ("مستويات الأهداف " if len(got) > 1 else "الهدف السعري ")
+                                             + " · ".join(_n(t) for t in got)
+                                             + f" (أعلى اليوم {_n(day_hi)}) · لا تأكيد لتنفيذ أي أمر من الوسيط"))
+          ''','target message')
+          block('    elif hchg >= WATCH["up_pct"]:',
+                '    elif hchg >= WATCH["up_early_pct"] and per != "الجلسة":',
+          '''    elif hchg >= WATCH["up_pct"]:
+                  hits.append(("up", rank, f"🚀 {who} {_n(px)} ({pct} {per}){_spike(WATCH['up_pct'])}"
+                                           + (" · لامس مستوى الدخول، التنفيذ غير مؤكد" if entry_touched else
+                                              (f" · السعر أعلى من مستوى Limit {_n(entry)}" if entry and px > float(entry) * 1.05 else ""))
+                                           + " · لا تطارد"))
+                  dkeys["up"] = f"up@{per}"
+          ''','momentum message')
+          
+          # Protect against clearly stale watchlist levels, not just stale 5m candles.
+          # Older JSON without a date is warned about rather than silently disabling /watch.
+          once('        co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}',
+               '''        raw_list_day = data.get("date") or data.get("asof")
+                  if raw_list_day:
+                      try:
+                          day = datetime.fromisoformat(str(raw_list_day)[:10]).date()
+                          days_old = (_ny_now().date() - day).days
+                      except (TypeError, ValueError):
+                          st["error"] = "invalid coiled date"
+                          print(f"[watch] {st['error']}: {raw_list_day!r}")
+                          return
+                      if not 0 <= days_old <= 5:
+                          st["error"] = f"stale coiled list: {raw_list_day} ({days_old} days old)"
+                          print(f"[watch] {st['error']}")
+                          return
+                  else:
+                      print("[watch] WARNING: coiled list has no date; source freshness unverified")
+                  co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}''',
+               'coiled freshness')
+
+          # Send each chunk, record only successfully accepted event keys.  This fixes
+          # duplicating a successfully sent first message if the second message fails.
+          chunk_func='''# FAISAL_QUIET_V119 — per-message delivery bookkeeping
+          # Rows are (event_key, kind, tier_rank, symbol, line).
+          def _deliver_watch_events(rows, title=None, silent=False):
+              if not rows:
+                  return 0
+              priority = {kind: i for i, kind in enumerate(WATCH_ORDER)}
+              rows = sorted(rows, key=lambda x: (priority.get(x[1], 999), x[2], x[3]))
+              heading = f"{RLM}👁️ المراقب · {_riyadh(time.time())}" + (f" · {title}" if title else "")
+              chunks, group, size = [], [], len(heading) + 1
+              for row in rows:
+                  line = f"{RLM}{row[4]}"
+                  if group and size + len(line) + 2 > 3400:
+                      chunks.append(group)
+                      group, size = [], len(heading) + 1
+                  group.append((row[0], line))
+                  size += len(line) + 2
+              if group:
+                  chunks.append(group)
+              delivered = 0
+              for group in chunks:
+                  msg = heading + "\\n" + "\\n".join(line for _, line in group)
+                  if "🧲" in msg and len(msg) + 42 < 4000:
+                      msg += f"\\n{RLM}🧲 = اندماج أو اتفاقية معلّقة"
+                  if _tg(msg, silent=silent):
+                      with _watch_lock:
+                          for event_key, _ in group:
+                              _watch_sent[event_key] = 1
+                              _watch_buf.pop(event_key, None)
+                      delivered += len(group)
+              return delivered
+          
+          
+          def _queue_failed_urgent(rows):
+              """Keep failed voice alerts queued until accepted in a later /watch round."""
+              with _watch_lock:
+                  for key, kind, rank, sym, line in rows:
+                      if key not in _watch_sent:
+                          _watch_buf[key] = (kind, rank, sym, line)
+          
+          
+          '''
+          once('def _at(arr, i):',chunk_func+'def _at(arr, i):','deliver helper')
+          
+          once('        found, keys, nodata, limited = {}, [], 0, 0',
+               '        found, keys, nodata, limited = {}, [], 0, 0\n        urgent_rows = []\n        with _watch_lock:\n            for event_key, value in _watch_buf.items():\n                if event_key[:10] == str(_ny_now().date()) and _urgent(value[0], value[1]):\n                    urgent_rows.append((event_key, *value))',
+               'urgent list')
+          once('                found.setdefault(k, []).append((rank, s, line))\n                keys.append(key)',
+               '                found.setdefault(k, []).append((rank, s, line))\n                keys.append(key)\n                urgent_rows.append((key, k, rank, s, line))',
+               'urgent entries')
+          block('        # v1.13: لا يُعلَّم التنبيه «مُرسلاً» إلا إذا قبله تيليجرام',
+                '        flushed = _watch_flush_due(now_t)',
+          '''        # Mark each accepted event individually, even if another chunk fails.
+                  delivered = _deliver_watch_events(urgent_rows) if urgent_rows else 0
+                  _queue_failed_urgent(urgent_rows)
+                  sent_ok = (delivered == len(urgent_rows)) if urgent_rows else None
+          ''', 'urgent delivery')
+          
+          block('def _watch_flush_due(now_t=None):','def _dm(d):', '''def _watch_flush_due(now_t=None):
+              """Quiet digest: 09:25 NY (premarket) and 19:45 NY (end of extended session).
+          
+              Keep scanning every 5 minutes; only notification cadence changes.
+              """
+              now_t = now_t or time.time()
+              ny = _ny_now(now_t)
+              minute = ny.hour * 60 + ny.minute
+              # Slot 1 tolerates a few minutes of scheduler delay; slot 2 ends at 20:00.
+              if 565 <= minute < 610:
+                  slot, title = 565, "قبل الافتتاح"
+              elif 1185 <= minute < 1200:
+                  slot, title = 1185, "ختام اليوم"
+              else:
+                  return 0
+              last_t = float(_watch_flush.get("at") or 0)
+              if last_t:
+                  previous = _ny_now(last_t)
+                  if previous.date() == ny.date() and previous.hour * 60 + previous.minute >= slot:
+                      return 0
+              today = str(ny.date())
+              with _watch_lock:
+                  # Expire yesterday's unreported events rather than reporting them late.
+                  for key in [k for k in _watch_buf if k[:10] != today]:
+                      _watch_buf.pop(key, None)
+                  items = {key: value for key, value in _watch_buf.items()
+                           if not _urgent(value[0], value[1])}
+              if not items:
+                  _watch_flush["at"] = now_t
+                  return 0
+              rows = [(key, *value) for key, value in items.items()]
+              delivered = _deliver_watch_events(rows, title=title, silent=True)
+              if delivered == len(items):
+                  _watch_flush["at"] = now_t
+              return delivered
+          
+          
+          ''','digest policy')
+          # Mark behavior without altering technical scoring, barriers, WATCH thresholds,
+          # COILED_URL logic, or the proxy API.
+          try:
+              ast.parse(s, filename=str(p))
+          except SyntaxError as e:
+              raise RuntimeError(f'Patched server fails syntax check: {e}')
+          assert '# FAISAL_QUIET_V119' in s
+          assert 'version="1.19.0"' in s
+          assert '"sweep_min_pct": 10.0' in s and '"sweep_max_pct": 15.0' in s
+          assert '"max_symbols": 120' in s
+          assert 'COILED_URL' in s and '@app.get("/watch")' in s
+          p.write_text(s,encoding='utf-8')
+          print(f'Patched {p} to Faisal quiet v1.19 — {len(s):,} characters')
+          PY_PATCH
+      - name: Validate syntax and notification behavior
+        run: |
+          python -m py_compile "$WATCH_TARGET"
+          python - <<'PY_TEST'
+          from pathlib import Path
+          import os
+          import ast, threading
+          from datetime import datetime, timezone
+          from types import SimpleNamespace
+          
+          SOURCE = Path(os.environ['WATCH_TARGET']).read_text(encoding='utf-8')
+          TREE = ast.parse(SOURCE)
+          FUNCS = {n.name:n for n in TREE.body if isinstance(n,ast.FunctionDef)}
+          for name in ('_urgent','_fresh','_deliver_watch_events','_queue_failed_urgent','_watch_flush_due','_watch_one'):
+              assert name in FUNCS, f'missing {name}'
+          
+          # Compile only notification functions to avoid side effects/network imports.
+          ns = {}
+          for name in ('_urgent','_fresh','_deliver_watch_events','_queue_failed_urgent','_watch_flush_due'):
+              exec(compile(ast.Module(body=[FUNCS[name]],type_ignores=[]), os.environ['WATCH_TARGET'], 'exec'),ns)
+          
+          assert ns['_urgent']('zone',0) is True
+          assert ns['_urgent']('zone',1) is False
+          assert ns['_urgent']('reclaim',0) is True
+          assert ns['_urgent']('reclaim2',0) is False
+          assert ns['_urgent']('early',0) is False
+          assert ns['_urgent']('up',0) is False
+          assert ns['_urgent']('take',0) is False
+          assert ns['_urgent']('down',0) is False
+          assert ns['_urgent']('down_stop',2) is True
+          
+          # Quotes from same day can still be stale; reject last trade >20 minutes ago.
+          t0=datetime(2026,11,11,12,0,tzinfo=timezone.utc).timestamp()
+          ns['time']=SimpleNamespace(time=lambda:t0)
+          ns['_ny_now']=lambda ts=None:datetime.fromtimestamp(t0 if ts is None else ts,timezone.utc)
+          assert ns['_fresh']({'date':'2026-11-11','last_ts':t0-600})
+          assert not ns['_fresh']({'date':'2026-11-11','last_ts':t0-3600})
+          assert not ns['_fresh']({'date':'2026-11-10','last_ts':t0-10})
+          
+          # Confirm per-chunk partial delivery does not mark failed messages as sent.
+          ns['WATCH_ORDER']=['up','early','zone','down_stop']
+          ns['RLM']='\u200f'
+          ns['_riyadh']=lambda t:'15:00'
+          ns['_watch_lock']=threading.Lock()
+          ns['_watch_sent']={};ns['_watch_buf']={};ns['_watch_flush']={'at':0}
+          sent_messages=[]
+          outcomes=iter([True,False])
+          def _tg(msg,silent=False):
+              sent_messages.append((msg,silent))
+              return next(outcomes)
+          ns['_tg']=_tg
+          rows=[('2026-11-11:A:up','up',2,'A','x'*1500),('2026-11-11:B:up','up',2,'B','y'*1500),('2026-11-11:C:up','up',2,'C','z'*1500)]
+          num=ns['_deliver_watch_events'](rows,silent=True)
+          assert num==2,(num,ns['_watch_sent'])
+          assert set(ns['_watch_sent'])=={rows[0][0],rows[1][0]}
+          assert len(sent_messages)==2
+          assert sent_messages[0][1] and sent_messages[1][1]
+          ns['_queue_failed_urgent'](rows)
+          assert set(ns['_watch_buf']) == {rows[2][0]}, 'only failed chunks should remain pending'
+          ns['_tg']=lambda msg,silent=False:True
+          assert ns['_deliver_watch_events']([(rows[2][0], 'up',2,'C','z'*1500)])==1
+          assert not ns['_watch_buf'], 'retry should clear pending event'
+          
+          # Two digest delivery slots in NY clock, not thirty-minute digests.
+          ns['_watch_sent'].clear();ns['_watch_buf'].clear()
+          ns['_tg']=lambda msg,silent=False:True
+          ns['_watch_buf']['2026-11-11:AAA:up']=('up',2,'AAA','🚀 event 1')
+          def clock(h,m):return datetime(2026,11,11,h,m,tzinfo=timezone.utc).timestamp()
+          assert ns['_watch_flush_due'](clock(9,20))==0
+          assert ns['_watch_flush_due'](clock(9,25))==1
+          ns['_watch_buf']['2026-11-11:BBB:up']=('up',2,'BBB','🚀 event 2')
+          assert ns['_watch_flush_due'](clock(9,35))==0
+          assert ns['_watch_flush_due'](clock(19,45))==1
+          assert len(ns['_watch_sent'])==2
+          
+          # Safety: notification texts must not assert actual fills or instruct sales.
+          strings=[n.value for n in ast.walk(FUNCS['_watch_one']) if isinstance(n,ast.Constant) and isinstance(n.value,str)]
+          for unsafe in ('نُفّذ غالباً','بِع حسب الخطة','لن يُنفَّذ'):
+              assert not any(unsafe in val for val in strings),f'unsafe assertion still active: {unsafe}'
+          assert 'position_confirmed = v.get("position_confirmed") is True' in SOURCE
+          assert 'stale coiled list' in SOURCE
+          assert '"sweep_min_pct": 10.0' in SOURCE and '"sweep_max_pct": 15.0' in SOURCE
+          print('PASS: 9 urgent classes, stale-data checks, partial sends, two digest slots, no assumed fills, unchanged technical thresholds')
+          PY_TEST
+      - name: Show change summary
+        run: |
+          git diff --stat -- "$WATCH_TARGET"
+          git diff --check -- "$WATCH_TARGET"
+      - name: Upload checked source and rollback original
+        uses: actions/upload-artifact@v4
+        with:
+          name: faisal-quiet-v119-reviewed
+          path: |
+            app.py
+            server.py
+            original/app.py
+            original/server.py
+      - name: Apply only when explicitly requested
+        if: ${{ github.event.inputs.mode == 'apply' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$WATCH_TARGET"
+          if ! git diff --cached --quiet; then
+            git commit -m "watch: quiet alerts, two daily digests, safer fills and freshness"
+            git push origin HEAD:main
+          else
+            echo "No code changes were needed."
+          fi
