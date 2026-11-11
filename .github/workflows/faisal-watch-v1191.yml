@@ -1,0 +1,353 @@
+# TurkiiMc/proxy-server/.github/workflows/faisal-watch-v1191.yml
+# No scheduling. Use preview first; apply updates only app.py on main.
+# Does not touch WATCH_KEY, alert cadence, Faisal's scoring or trade rules.
+name: Faisal Watch v1.19.1 - reliability
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preview only, or apply tested app.py to main"
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: faisal-watch-v1191
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout proxy-server main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Guard repository and preserve original
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TurkiiMc/proxy-server" || { echo "Wrong repository"; exit 1; }
+          test "$GITHUB_REF_NAME" = "main" || { echo "Please run on main branch"; exit 1; }
+          test -f app.py || { echo "app.py not found"; exit 1; }
+          mkdir -p _review/original
+          cp app.py _review/original/app.py
+
+      - name: Prepare v1.19.1 patch (local working tree only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_PATCH'
+          #!/usr/bin/env python3
+          """Safe, anchor-checked patch from Faisal proxy app.py 1.19.0 to 1.19.1.
+          Does not touch credentials, technical rules, scoring, or notification cadence.
+          """
+          import ast
+          import sys
+          from pathlib import Path
+
+          p = Path(sys.argv[1] if len(sys.argv)>1 else 'app.py')
+          s = p.read_text(encoding='utf-8')
+          if 'version="1.19.1"' in s and '# FAISAL_WATCH_V1191' in s:
+              print('Already on v1.19.1; no changes.')
+              sys.exit(0)
+          if 'version="1.19.0"' not in s or 'FAISAL_QUIET_V119' not in s or '@app.get("/watch")' not in s:
+              raise SystemExit('FAIL CLOSED: expected reviewed app.py v1.19.0 with known anchors')
+
+
+          def once(old,new,label):
+              global s
+              n=s.count(old)
+              if n!=1: raise RuntimeError(f'{label}: expected one anchor; got {n}')
+              s=s.replace(old,new,1)
+
+          def block(start,end,new,label):
+              global s
+              if s.count(start)!=1 or s.count(end)!=1: raise RuntimeError(f'{label}: anchors not unique')
+              a=s.index(start); b=s.index(end,a+len(start))
+              s=s[:a]+new+s[b:]
+
+          once('version="1.19.0"','version="1.19.1"','version')
+          once('Server — Yahoo Finance API Proxy (v1.19 — quiet notifications)',
+               'Server — Yahoo Finance API Proxy (v1.19.1 — watch audit and guarded state)', 'description')
+          once('_watch_flush = {"at": 0.0}',
+               '''# FAISAL_WATCH_V1191: timed events are retained alongside delivery state.
+          _watch_audit = {}      # event_id -> {bar_open_utc, detected_at_utc, source, basis, ...}
+          _watch_flush = {"at": 0.0}''', 'audit dict')
+
+          block('def _state_merge():', '\ndef _state_save():', '''def _state_merge():
+              """Merge last checkpoint across workers; a Render Free redeploy still loses local state."""
+              st = _state_load()
+              with _watch_lock:
+                  for k in (st.get("sent") or {}):
+                      _watch_sent[k] = 1
+                  for k, v in (st.get("buf") or {}).items():
+                      if k not in _watch_sent and k not in _watch_buf and isinstance(v, (list, tuple)) and len(v) == 4:
+                          _watch_buf[k] = tuple(v)
+                  for k, v in (st.get("audit") or {}).items():
+                      if isinstance(v, dict) and k not in _watch_audit:
+                          _watch_audit[k] = v
+                  for k in [k for k in _watch_buf if k in _watch_sent]:
+                      _watch_buf.pop(k, None)
+                  _watch_flush["at"] = max(float(_watch_flush.get("at") or 0), float(st.get("flush_at") or 0))
+
+          ''', 'state merge')
+
+          block('def _state_save():', '\n@contextmanager\ndef _run_lock():', '''def _state_save():
+              """Atomic, best-effort checkpoint. Not durable on Render Free after redeploy."""
+              with _watch_lock:
+                  days = sorted({k[:10] for k in (_watch_sent.keys() | _watch_buf.keys() | _watch_audit.keys())})
+                  keep = set(days[-4:])
+                  for coll in (_watch_sent, _watch_buf, _watch_audit):
+                      for k in [k for k in coll if k[:10] not in keep]:
+                          coll.pop(k, None)
+                  data = {
+                      "sent": dict(_watch_sent),
+                      "buf": {k: list(v) for k, v in _watch_buf.items()},
+                      "audit": dict(_watch_audit),
+                      "flush_at": _watch_flush.get("at") or 0,
+                      "last": {k: v for k, v in _watch_last.items() if k != "running"},
+                  }
+              path = _state_path()
+              os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+              tmp = f"{path}.{os.getpid()}.tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  _json.dump(data, f, ensure_ascii=False)
+              os.replace(tmp, path)
+
+
+          def _watch_audit_log(phase, event_key, **kw):
+              """Render log trail; timestamps are UTC and never contain credentials."""
+              payload = {"phase": phase, "event_id": event_key, **kw}
+              print("[watch-audit] " + _json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+          ''', 'state save and audit logger')
+
+          # Checkpoint as each chunk is accepted; report exact Telegram-accepted timestamp.
+          once('''            delivered += len(group)
+              return delivered
+          ''', '''            accepted = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                      for event_key, _ in group:
+                          with _watch_lock:
+                              meta = dict(_watch_audit.get(event_key) or {})
+                              _watch_audit.setdefault(event_key, {})["telegram_accepted_at_utc"] = accepted
+                          _watch_audit_log("telegram_accepted", event_key,
+                                           telegram_accepted_at_utc=accepted,
+                                           detected_at_utc=meta.get("detected_at_utc"),
+                                           bar_open_utc=meta.get("bar_open_utc"))
+                      try:
+                          _state_save()
+                      except Exception as exc:
+                          print(f"[watch] checkpoint after Telegram acceptance FAILED: {exc}", flush=True)
+                      delivered += len(group)
+              return delivered
+          ''','per-chunk delivered log')
+
+          once('''            if key not in _watch_sent:
+                          _watch_buf[key] = (kind, rank, sym, line)
+          ''', '''            if key not in _watch_sent:
+                          _watch_buf[key] = (kind, rank, sym, line)
+              try:
+                  _state_save()
+              except Exception as exc:
+                  print(f"[watch] checkpoint pending alert FAILED: {exc}", flush=True)
+          ''', 'pending voice')
+
+          # First 5-minute bar to touch 7% and 15% above reference inside current period.
+          once('''    top = max(seg, key=lambda b: b["h"])                 # أعلى سعر في الفترة الحالية، ولو عاد السعر بعده
+              return {"session": session, "last_ts": last["t"],''', '''    top = max(seg, key=lambda b: b["h"])                 # أعلى سعر في الفترة الحالية، ولو عاد السعر بعده
+              first7 = next((b["t"] for b in seg if ref > 0 and b["h"] >= ref * 1.07), None)
+              first15 = next((b["t"] for b in seg if ref > 0 and b["h"] >= ref * 1.15), None)
+              return {"session": session, "first_early_ts": first7, "first_up_ts": first15,
+                      "last_ts": last["t"],''', 'candle crossing timestamps')
+
+          once('''    return s["date"], [(k, r_, line, dkeys.get(k, k)) for k, r_, line in hits]''', '''    # The open time of the FIRST crossing 5m candle is known for 🚀/⚡,
+              # not the exact trade timestamp. Other signals carry latest-candle time ONLY.
+              output = []
+              for k, r_, line in hits:
+                  first = s.get("first_up_ts") if k == "up" else (s.get("first_early_ts") if k == "early" else None)
+                  bar_ts = int(first or s["last_ts"])
+                  basis = "first_threshold_5m_bar_open" if first else "latest_available_5m_bar_open"
+                  output.append((k, r_, line, dkeys.get(k, k), bar_ts, src, basis))
+              return s["date"], output''', 'event timing return')
+
+          once('''            for k, rank, line, dk in hits:
+                          key = f"{d}:{s}:{dk}"''', '''            for k, rank, line, dk, bar_ts, source, basis in hits:
+                          key = f"{d}:{s}:{dk}"''', 'timing unpack')
+
+          once('''                    if key in _watch_sent or key in _watch_buf:     # كل نوع مرة واحدة لكل سهم في اليوم
+                                  continue
+                              if not _urgent(k, rank):''', '''                    if key in _watch_sent or key in _watch_buf:     # كل نوع مرة واحدة لكل سهم في اليوم
+                                  continue
+                              bar_iso = datetime.fromtimestamp(bar_ts, timezone.utc).isoformat(timespec="seconds")
+                              detected_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                              _watch_audit[key] = {"symbol": s, "kind": k,
+                                                   "source": source, "bar_open_utc": bar_iso,
+                                                   "basis": basis, "detected_at_utc": detected_iso,
+                                                   "lag_since_bar_open_seconds": max(0, int(time.time() - bar_ts))}
+                              _watch_audit_log("detected", key, **_watch_audit[key])
+                              if not _urgent(k, rank):''', 'detection audit')
+
+          once('''        raw_list_day = data.get("date") or data.get("asof")
+                  if raw_list_day:''', '''        raw_list_day = data.get("date") or data.get("asof")
+                  if not raw_list_day:
+                      st["error"] = "coiled list missing date/asof; no alerts sent"
+                      print(f"[watch] {st['error']}", flush=True)
+                      return
+                  if raw_list_day:''', 'date required')
+
+          # Reduce stale calendar tolerance to two weekdays (weekends don't count).
+          once('''            if not 0 <= days_old <= 5:
+                          st["error"] = f"stale coiled list: {raw_list_day} ({days_old} days old)"''', '''            working_age = sum((day + timedelta(days=j)).weekday() < 5
+                                        for j in range(1, days_old + 1)) if days_old >= 0 else -1
+                      if not 0 <= working_age <= 2:
+                          st["error"] = f"stale coiled list: {raw_list_day} ({working_age} weekdays old)"''', 'weekday staleness')
+
+          once('''        co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}''', '''        if not isinstance(data.get("list"), dict):
+                      st["error"] = "coiled list missing or invalid 'list' dictionary"
+                      print(f"[watch] {st['error']}", flush=True)
+                      return
+                  co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}''', 'list shape')
+
+          # Before completing a round, flush pending + audit state early.
+          once('''        flushed = _watch_flush_due(now_t)
+                  msgs = keys''', '''        try:
+                      _state_save()  # pending silent events survive errors in the remaining round (not a Render redeploy)
+                  except Exception as exc:
+                      print(f"[watch] checkpoint after scan FAILED: {exc}", flush=True)
+                  flushed = _watch_flush_due(now_t)
+                  msgs = keys''', 'round checkpoint')
+
+          # Watch status reports how many audit entries exist, no extras in Telegram.
+          once('''                   "digest_waiting": len(_watch_buf)})''', '''                   "digest_waiting": len(_watch_buf),
+                             "audit_events": len(_watch_audit),
+                             "state_note": "Local file only; Render Free cannot retain it across redeploys"})''', 'status audit')
+
+          ast.parse(s)
+          p.write_text(s, encoding='utf-8')
+          print(f'PASS: v1.19.1 patched; lines={len(s.splitlines())}')
+          PY_PATCH
+
+      - name: Validate Python and notification scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q --disable-pip-version-check requests fastapi
+          python -m py_compile app.py
+          TEST_APP=app.py python - <<'PY_TEST'
+          import importlib.util, json, os, tempfile
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from unittest.mock import patch
+
+          src=os.environ.get('TEST_APP','/mnt/data/app_v1191_test.py')
+          spec=importlib.util.spec_from_file_location('faisal_v1191',src)
+          a=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(a)
+          assert a.app.version=='1.19.1'
+          assert a.WATCH['max_symbols']==120
+          assert a.WATCH['sweep_min_pct']==10.0
+          assert a.WATCH['sweep_max_pct']==15.0
+          assert a._urgent('zone',0) and not a._urgent('up',0) and not a._urgent('zone',1)
+
+          # First crossing = open time of first 5m candle, not time of daily peak or last bar.
+          from zoneinfo import ZoneInfo
+          ny=ZoneInfo('America/New_York')
+          today=a._ny_now().date()
+          yesterday=today-timedelta(days=1)
+          def uni(day, hour,minute):
+              return int(datetime(day.year,day.month,day.day,hour,minute,tzinfo=ny).timestamp())
+          prev=uni(yesterday,15,55)
+          t1=uni(today,4,0)
+          t2=uni(today,4,5)
+          t3=uni(today,4,10)
+          result={'timestamp':[prev,t1,t2,t3], 'indicators':{'quote':[{'close':[2,2.1,2.15,2.05],'high':[2,2.11,2.35,2.10], 'low':[2,2,2.1,2],'volume':[10,20,30,40]}]}}
+          ss=a._sessions(result)
+          assert ss['first_early_ts']==t2, ss
+          assert ss['first_up_ts']==t2, ss
+          with patch.object(a,'_chart',return_value=(result,None)),patch.object(a,'_fresh',return_value=True):
+            date,events=a._watch_one('ZZZZ',{'kinds':['👁️ مراقبة']})
+            assert date==str(today)
+            rise=[e for e in events if e[0]=='up']
+            assert len(rise)==1 and rise[0][4]==t2 and rise[0][6]=='first_threshold_5m_bar_open',events
+          print('PASS: peak spike event records first qualifying 5m candle')
+
+          with tempfile.TemporaryDirectory() as td:
+              os.environ['WATCH_STATE_FILE']=str(Path(td)/'state.json')
+              a._watch_sent.clear(); a._watch_buf.clear(); a._watch_audit.clear()
+              a._watch_flush['at']=0
+              event_key=f'{today}:ZZZZ:zone'
+              a._watch_audit[event_key]={'detected_at_utc':'2026-11-11T00:00:00+00:00','bar_open_utc':'2026-11-10T23:55:00+00:00'}
+              with patch.object(a,'_tg',return_value=True):
+                  n=a._deliver_watch_events([(event_key,'zone',0,'ZZZZ','🎯 ZZZZ')])
+              assert n==1
+              state=json.loads(Path(os.environ['WATCH_STATE_FILE']).read_text())
+              assert state['sent'].get(event_key)==1 and state['audit'][event_key].get('telegram_accepted_at_utc')
+              a._watch_sent.clear(); a._watch_buf.clear(); a._watch_audit.clear(); a._state_merge()
+              assert event_key in a._watch_sent and 'telegram_accepted_at_utc' in a._watch_audit[event_key]
+              print('PASS: per-message checkpoint and restore in same filesystem')
+
+              # Invalid/missing or stale coiled must fail closed before processing symbol set.
+              class Resp:
+                  status_code=200
+                  def __init__(self,data): self.data=data
+                  def json(self): return self.data
+              os.environ['COILED_URL']='https://example.invalid/coiled.json'
+              a._watch_last['error']=None
+              with patch.object(a.requests,'get',return_value=Resp({'list':{'ZZZZ':{}}})):
+                  a._watch_run_inner()
+              assert a._watch_last['error'] and 'missing date' in a._watch_last['error'],a._watch_last
+              print('PASS: missing list date rejected')
+              a._watch_last['error']=None
+              old=str(today-timedelta(days=9))
+              with patch.object(a.requests,'get',return_value=Resp({'date':old,'list':{'ZZZZ':{}}})):
+                  a._watch_run_inner()
+              assert a._watch_last['error'] and 'stale coiled' in a._watch_last['error'],a._watch_last
+              print('PASS: stale coiled date rejected')
+              a._watch_last['error']=None
+              a._watch_sent.clear(); a._watch_buf.clear(); a._watch_audit.clear()
+              def emit(sym, v):
+                  return str(today), [('zone',0,'🎯 ZZZZ','zone',t3,'Yahoo','latest_available_5m_bar_open')]
+              with patch.object(a.requests,'get',return_value=Resp({'date':str(today),'list':{'ZZZZ':{}}})),patch.object(a,'_watch_one',side_effect=emit),patch.object(a,'_tg',return_value=True):
+                  a._watch_run_inner()
+              assert a._watch_last['checked']==1,a._watch_last
+              assert a._watch_last['telegram_ok'] is True,a._watch_last
+              assert a._watch_last['audit_events'] >= 1
+              state=json.loads(Path(os.environ['WATCH_STATE_FILE']).read_text())
+              assert state['sent'][event_key]==1 and state['audit'][event_key].get('bar_open_utc')
+              print('PASS: active scan records detection, send and checkpoint; 5m cadence unchanged')
+          print('PASS: all v1.19.1 checks')
+          PY_TEST
+          git diff --check -- app.py
+          git diff --stat -- app.py
+
+      - name: Save reviewed source and rollback copy
+        uses: actions/upload-artifact@v4
+        with:
+          name: faisal-watch-v1191-reviewed
+          path: |
+            app.py
+            _review/original/app.py
+
+      - name: Commit only if apply was explicitly selected
+        if: ${{ github.event.inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- app.py
+          if git diff --cached --quiet; then
+            echo "No changes needed; app.py is already up to date."
+            exit 0
+          fi
+          git commit -m "watch: audit timestamps, checkpoint sends, validate list age (v1.19.1)"
+          git push origin HEAD:main
