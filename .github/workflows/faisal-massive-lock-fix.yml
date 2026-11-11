@@ -1,0 +1,196 @@
+# Only fixes the Massive shared lock in TurkiiMc/proxy-server. Does not change app.py or Telegram.
+name: Faisal - Massive gate lock contention fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preview first, then apply after tests succeed"
+        type: choice
+        default: preview
+        required: true
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: faisal-massive-lock-fix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fix-massive-lock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout proxy-server
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify repository and baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'TurkiiMc/proxy-server'
+          test "$GITHUB_REF_NAME" = 'main'
+          test -f massive_guard.py
+          grep -q 'FAISAL_MASSIVE_SHARED_GATE_V1' massive_guard.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependency
+        run: python -m pip install -q requests
+
+      - name: Stage bounded lock retry without changing live app
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_PATCH'
+          from pathlib import Path
+          import ast
+          p = Path('massive_guard.py')
+          assert p.is_file(), 'massive_guard.py missing: apply preceding shared guard first'
+          s = p.read_text(encoding='utf-8')
+          assert 'FAISAL_MASSIVE_SHARED_GATE_V1' in s, 'unknown Massive guard; refusing changes'
+          old = '        how = fcntl.LOCK_EX | (fcntl.LOCK_NB if lock_nonblocking else 0)\n        fcntl.flock(lock, how)\n'
+          new = '        # FAISAL_MASSIVE_LOCK_RETRY_V2: brief contention is not an API failure.\n        # Wait no more than one second; never bypass the shared request budget.\n        if lock_nonblocking:\n            deadline = time.monotonic() + 1.0\n            while True:\n                try:\n                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n                    break\n                except BlockingIOError:\n                    if time.monotonic() >= deadline:\n                        raise\n                    time.sleep(0.01)\n        else:\n            fcntl.flock(lock, fcntl.LOCK_EX)\n'
+          if new in s:
+              print('Fix already present; leaving file unchanged')
+          else:
+              assert s.count(old) == 1, 'unexpected lock implementation; refusing changes'
+              s = s.replace(old, new, 1)
+              ast.parse(s, filename=str(p))
+              p.write_text(s, encoding='utf-8')
+              print('Installed bounded shared-lock retry (max 1 second)')
+          assert new in p.read_text(encoding='utf-8')
+          # Reserve timestamps must be read AFTER acquiring the lock, so
+          # a waiting worker cannot drop newer reservations as future events.
+          s = p.read_text(encoding='utf-8')
+          old2 = 'def _reserve():\n    now = time.time()\n    limit = _int_env('
+          new2 = 'def _reserve():\n    limit = _int_env('
+          if old2 in s:
+              s = s.replace(old2, new2, 1)
+              old3 = "    def update(state):\n        if now < float(state.get('cooldown_until') or 0):"
+              new3 = "    def update(state):\n        now = time.time()  # FAISAL_MASSIVE_RESERVATION_CLOCK_V2\n        if now < float(state.get('cooldown_until') or 0):"
+              assert s.count(old3) == 1, 'unknown reserve clock implementation'
+              s = s.replace(old3, new3, 1)
+              ast.parse(s, filename=str(p))
+              p.write_text(s, encoding='utf-8')
+          else:
+              assert 'FAISAL_MASSIVE_RESERVATION_CLOCK_V2' in s, 'unknown reserve clock; refusing changes'
+          print('Shared quota timestamp verified inside lock')
+          PY_PATCH
+          python -m py_compile massive_guard.py
+          git diff --check
+          test "$(git diff --name-only | wc -l | tr -d ' ')" -le 1
+          if ! git diff --name-only | grep -q '^massive_guard.py$'; then
+            echo 'No file changes (already patched)'
+          fi
+
+      - name: Test lock contention, worker burst, and 429 offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD" python - <<'PY_TEST'
+          import contextlib
+          import fcntl
+          import io
+          import json
+          import os
+          import tempfile
+          import threading
+          import time
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor
+          from unittest.mock import patch
+          import massive_guard as gate
+
+          class Response:
+              def __init__(self, status):
+                  self.status_code = status
+                  self.headers = {'Retry-After': '240'} if status == 429 else {}
+
+          with tempfile.TemporaryDirectory() as td:
+              with patch.dict(os.environ, {'WATCH_STATE_FILE': str(Path(td)/'state.json'),
+                                           'MASSIVE_MAX_REQUESTS_PER_MIN': '4',
+                                           'MASSIVE_429_COOLDOWN_SEC': '180'}):
+                  # Reproduce actual contention, then release the lock shortly afterward.
+                  lock_path = str(gate._state_file()) + '.lock'
+                  with open(lock_path, 'a+') as lock:
+                      fcntl.flock(lock, fcntl.LOCK_EX)
+                      result = []
+                      errors = []
+                      def reserve():
+                          try:
+                              result.append(gate._reserve())
+                          except Exception as exc:
+                              errors.append(exc)
+                      t = threading.Thread(target=reserve)
+                      t.start()
+                      time.sleep(0.15)
+                      assert t.is_alive(), 'test did not exercise lock contention'
+                      fcntl.flock(lock, fcntl.LOCK_UN)
+                      t.join(timeout=4)
+                      assert not t.is_alive() and not errors and result == ['allowed'], (errors, result)
+                      print('OK: brief flock contention retries successfully')
+
+                  # Simulate a 16-way burst; only 4 API calls, and no spurious gate-unavailable.
+                  gate._edit(lambda st: st.update({'requests': [], 'cooldown_until': 0}))
+                  with patch.object(gate.requests, 'get', return_value=Response(200)) as get:
+                      with ThreadPoolExecutor(max_workers=16) as ex:
+                          outcomes = list(ex.map(lambda _: gate.guarded_get('https://api.massive.com/test')[1], range(24)))
+                      assert outcomes.count('http_200') == 4, outcomes
+                      assert outcomes.count('skipped_minute_budget') == 20, outcomes
+                      assert get.call_count == 4
+                      print('OK: 16-worker contention honors quota, no BlockingIOError skips')
+
+                  # Preserve shared HTTP 429 cooldown.
+                  gate._edit(lambda st: st.update({'requests': [], 'cooldown_until': 0}))
+                  with patch.object(gate.requests, 'get', return_value=Response(429)) as get:
+                      _, one = gate.guarded_get('https://api.massive.com/test')
+                      none, two = gate.guarded_get('https://api.massive.com/test')
+                      assert one == 'http_429' and none is None and two == 'skipped_429_cooldown'
+                      assert get.call_count == 1
+                      print('OK: shared HTTP 429 cooldown preserved')
+          print('LOCK_FIX_TESTS_PASS')
+          PY_TEST
+
+      - name: Save preview patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/massive-lock-preview
+          git diff -- massive_guard.py > /tmp/massive-lock-preview/massive_guard.patch
+          printf 'Only massive_guard.py; bounded wait for shared flock. No changes to watch rules or Telegram.\n' > /tmp/massive-lock-preview/README.txt
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: faisal-massive-lock-fix-preview
+          path: /tmp/massive-lock-preview/
+
+      - name: Apply only after successful tests and explicit apply selection
+        if: ${{ success() && inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'faisal-watch-bot'
+          git config user.email 'faisal-watch-bot@users.noreply.github.com'
+          git add -- massive_guard.py
+          if git diff --cached --quiet; then
+            echo 'Already applied; nothing to commit'
+            exit 0
+          fi
+          git commit -m 'fix: wait briefly for Massive cross-worker lock instead of skipping'
+          git push origin HEAD:main
+
+      - name: Review only (no deployment)
+        if: ${{ success() && inputs.mode == 'preview' }}
+        run: echo 'PREVIEW SUCCESS - no live files changed. Run apply to deploy.'
