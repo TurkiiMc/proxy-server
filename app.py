@@ -882,6 +882,7 @@ def _watch_run_inner():
         co = _select_watch_symbols(co, WATCH["max_symbols"], int(time.time() // 300))
         futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
         found, keys, nodata, limited = {}, [], 0, 0
+        diag_missing = []
         urgent_rows = []
         with _watch_lock:
             for event_key, value in _watch_buf.items():
@@ -896,7 +897,9 @@ def _watch_run_inner():
             if d == "429":
                 limited += 1; continue
             if d is None:
-                nodata += 1; continue
+                nodata += 1
+                diag_missing.append(s)
+                continue
             for k, rank, line, dk in hits:
                 key = f"{d}:{s}:{dk}"                  # dk = النوع، أو «up@الفترة» لـ🚀 و⚡ (مرة لكل فترة)
                 with _watch_lock:
@@ -922,6 +925,13 @@ def _watch_run_inner():
                    "list_date": data.get("date"), "telegram_ok": sent_ok, "digest_sent": flushed,
                    "digest_waiting": len(_watch_buf)})
         print(f"[watch] فُحص {len(co)} · تنبيهات {len(msgs)} · بلا بيانات {nodata}")
+        # FAISAL_ALPACA_SOURCE_DIAG_V1 — silent background sampling; no signal changes.
+        try:
+            from source_diagnostics import schedule_source_diagnostic
+            schedule_source_diagnostic(list(co), diag_missing, _chart,
+                                       _massive_result, _sessions, _fresh, _state_path())
+        except Exception as diag_exc:
+            print(f"[source-diag] scheduling failed ({type(diag_exc).__name__}); /watch unaffected")
     except Exception as e:
         st["error"] = str(e); print(f"[watch] خطأ: {e}")
     finally:
