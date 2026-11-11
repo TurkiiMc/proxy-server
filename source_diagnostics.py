@@ -9,6 +9,7 @@ import threading
 import json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+import massive_guard as _massive_guard  # FAISAL_MASSIVE_SHARED_GATE_V1
 from collections import Counter
 
 import requests
@@ -133,11 +134,13 @@ def _massive_probe(sym, now):
         day = datetime.fromtimestamp(now, ZoneInfo('America/New_York')).date()
         start_day = str(day - timedelta(days=5))
         # Mirror app.py original parameters; only the diagnostic result is logged.
-        resp = requests.get(
+        resp, gate = _massive_guard.guarded_get(
             f'https://api.massive.com/v2/aggs/ticker/{sym.replace(".", "-")}/range/5/minute/{start_day}/{day}',
             params={'adjusted': 'true', 'sort': 'asc', 'limit': 5000, 'apiKey': key},
             timeout=12,
         )
+        if resp is None:
+            return gate, None  # Rate-limited skip, not evidence of no trades
         code = int(resp.status_code)
         if code != 200:
             return f'http_{code}', None
@@ -173,8 +176,11 @@ def _run_sample(symbols, originally_missing, chart, massive, sessions, fresh):
             yage = _latest_age((y.get('timestamp') or [None])[-1], now) if y else None
         except Exception:
             ystate, yage = 'exception', None
-        # Separate read-only diagnostic probe: preserves original /watch Massive fallback.
-        mstate, mage = _massive_probe(sym, now)
+        # Fresh Yahoo: do not spend a Massive API call on a redundant comparison.
+        if ystate == 'fresh':
+            mstate, mage = 'skipped_yahoo_fresh', None
+        else:
+            mstate, mage = _massive_probe(sym, now)
         istate = iex_results.get(sym, 'missing') if iex_request == 'ok' else iex_request
         for src, status in [('yahoo', ystate), ('massive', mstate), ('iex', istate)]:
             counts[src][status] += 1

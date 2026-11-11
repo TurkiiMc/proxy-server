@@ -648,6 +648,8 @@ def _sessions(result):
 
 
 # ---- v1.9: Massive (Polygon سابقاً) بديلاً حين لا تُظهر Yahoo صفقات اليوم ----
+# FAISAL_MASSIVE_SHARED_GATE_V1: shared Massive budget for live and diagnostics
+import massive_guard as _massive_guard
 MASSIVE_BASE = "https://api.massive.com"
 _mv_state = {"blocked_until": 0.0, "last_status": None}
 
@@ -655,18 +657,22 @@ _mv_state = {"blocked_until": 0.0, "last_status": None}
 def _massive_result(sym):
     """شموع 5 دقائق ليومين (تشمل الجلسات الممتدة) بصيغة Yahoo نفسها، أو None"""
     key = os.environ.get("MASSIVE_API_KEY")
-    if not key or time.time() < _mv_state["blocked_until"]:
+    if not key:
         return None
     today = _ny_now().date()
     frm = str(today - timedelta(days=5))
     try:
-        r = requests.get(f"{MASSIVE_BASE}/v2/aggs/ticker/{_y(sym)}/range/5/minute/{frm}/{today}",
-                         params={"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": key}, timeout=20)
+        r, gate = _massive_guard.guarded_get(
+            f"{MASSIVE_BASE}/v2/aggs/ticker/{_y(sym)}/range/5/minute/{frm}/{today}",
+            params={"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": key}, timeout=20)
+        if r is None:
+            _mv_state["last_status"] = gate
+            return None
     except Exception as e:
         _mv_state["last_status"] = str(e); return None
     _mv_state["last_status"] = r.status_code
-    if r.status_code == 429:                       # حد الطلبات: توقف دقيقتين
-        _mv_state["blocked_until"] = time.time() + 120; return None
+    if r.status_code == 429:
+        return None   # global cross-worker cooldown is owned by massive_guard
     if r.status_code != 200:
         return None
     rows = (r.json() or {}).get("results") or []
