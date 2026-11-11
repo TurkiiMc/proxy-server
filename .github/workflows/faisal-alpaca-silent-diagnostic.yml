@@ -1,0 +1,384 @@
+# Upload to TurkiiMc/proxy-server/.github/workflows/faisal-alpaca-source-diagnostic.yml
+# Read-only, silent source diagnostics: Yahoo / Massive / Alpaca IEX.
+# Does NOT replace /watch prices, add trading signals, or send Telegram messages.
+name: Faisal - silent Alpaca IEX source diagnosis
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preview first, then apply only after checks pass"
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: faisal-proxy-patch
+  cancel-in-progress: false
+
+jobs:
+  silent-diagnostic-patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Safety checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'TurkiiMc/proxy-server'
+          test "$GITHUB_REF_NAME" = 'main'
+          test -f app.py
+          grep -q 'def _watch_run_inner' app.py
+          grep -q 'def _watch_one' app.py
+          grep -q 'def _massive_result' app.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Prepare silent diagnostic helper (local preview only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f source_diagnostics.py ] && ! grep -q 'FAISAL_ALPACA_SOURCE_DIAG_V1' source_diagnostics.py; then
+            echo 'Existing source_diagnostics.py is unrelated; refusing to overwrite it.'
+            exit 1
+          fi
+          cat > source_diagnostics.py <<'PY_SOURCE_DIAG'
+          """FAISAL_ALPACA_SOURCE_DIAG_V1: read-only, silent Yahoo/Massive/Alpaca IEX diagnostic.
+
+          No trades, no Telegram, no changes to primary quote source or /watch signals.
+          Runs at most once per 30-minute slot across Render workers, using an advisory file lock.
+          """
+          import os
+          import time
+          import threading
+          import json
+          from datetime import datetime, timezone
+          from collections import Counter
+
+          import requests
+
+
+          def _latest_age(ts, now=None):
+              """Age in minutes or None; supports Unix timestamps and Alpaca RFC3339 strings."""
+              now = time.time() if now is None else now
+              try:
+                  if isinstance(ts, str):
+                      s = ts.strip().replace('Z', '+00:00')
+                      dt = datetime.fromisoformat(s)
+                      if dt.tzinfo is None:
+                          return None
+                      ts = dt.astimezone(timezone.utc).timestamp()
+                  return (float(now) - float(ts)) / 60.0
+              except (TypeError, ValueError, OverflowError):
+                  return None
+
+
+          def _label_age(ts, now=None):
+              age = _latest_age(ts, now)
+              if age is None:
+                  return 'missing'
+              if age < -1:
+                  return 'future'
+              if age <= 20:
+                  return 'fresh'
+              return 'stale'
+
+
+          def _status_session(result, err, sessions, fresh):
+              if err:
+                  return '429' if '429' in str(err) else 'error'
+              if not result:
+                  return 'no_bars'
+              try:
+                  s = sessions(result)
+              except Exception:
+                  return 'invalid_sessions'
+              if not s:
+                  # Bars can exist yet be unusable for the monitor's prior-close/reference logic.
+                  return 'invalid_sessions'
+              try:
+                  return 'fresh' if fresh(s) else ('stale' if s.get('last_ts') else 'invalid_sessions')
+              except Exception:
+                  return 'invalid_sessions'
+
+
+          def _select_sample(symbols, missing, slot, miss_cap=5, ok_cap=2):
+              all_syms = sorted(set(symbols))
+              miss = sorted(set(missing) & set(all_syms))
+              ok = sorted(set(all_syms) - set(miss))
+
+              def rotate(items, cap, seed):
+                  if not items:
+                      return []
+                  count = min(len(items), cap)
+                  start = (int(seed) * count) % len(items)
+                  return [items[(start + i) % len(items)] for i in range(count)]
+
+              return rotate(miss, miss_cap, slot) + rotate(ok, ok_cap, slot), set(miss)
+
+
+          def _claim_slot(state_path, slot):
+              """Prevents repeated probes across different uvicorn workers in the same slot."""
+              try:
+                  import fcntl
+                  path = state_path + '.source_diag_slot'
+                  with open(path, 'a+', encoding='ascii') as f:
+                      fcntl.flock(f, fcntl.LOCK_EX)
+                      f.seek(0)
+                      if f.read().strip() == str(slot):
+                          return False
+                      f.seek(0)
+                      f.truncate()
+                      f.write(str(slot))
+                      f.flush()
+                      return True
+              except Exception as e:
+                  # The monitoring path remains fully operational if diagnostics cannot lock.
+                  print(f'[source-diag] slot lock unavailable ({type(e).__name__}); skipping')
+                  return False
+
+
+          def _alpaca_latest(symbols, now=None):
+              """One batched IEX request; never includes API credentials in logs."""
+              key = os.environ.get('APCA_API_KEY_ID') or os.environ.get('ALPACA_API_KEY_ID')
+              secret = os.environ.get('APCA_API_SECRET_KEY') or os.environ.get('ALPACA_API_SECRET_KEY')
+              if not key or not secret:
+                  return 'missing_credentials', {}
+              try:
+                  resp = requests.get(
+                      'https://data.alpaca.markets/v2/stocks/bars/latest',
+                      params={'symbols': ','.join(symbols), 'feed': 'iex'},
+                      headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret},
+                      timeout=12,
+                  )
+                  if resp.status_code != 200:
+                      return f'http_{resp.status_code}', {}
+                  bars = (resp.json() or {}).get('bars') or {}
+                  if not isinstance(bars, dict):
+                      return 'bad_response', {}
+                  return 'ok', {s: _label_age((bars.get(s) or {}).get('t'), now) for s in symbols}
+              except Exception as exc:
+                  return f'network_{type(exc).__name__}', {}
+
+
+          def _run_sample(symbols, originally_missing, chart, massive, sessions, fresh):
+              start = time.time()
+              now = time.time()
+              iex_request, iex_results = _alpaca_latest(symbols, now)
+              counts = {'yahoo': Counter(), 'massive': Counter(), 'iex': Counter()}
+              rescued = []
+              for sym in symbols:
+                  try:
+                      y, err = chart(sym, '2d', '5m', True)
+                      ystate = _status_session(y, err, sessions, fresh)
+                  except Exception:
+                      ystate = 'exception'
+                  if not os.environ.get('MASSIVE_API_KEY'):
+                      mstate = 'not_configured'
+                  else:
+                      try:
+                          m = massive(sym)
+                          mstate = _status_session(m, None, sessions, fresh)
+                      except Exception:
+                          mstate = 'exception'
+                  istate = iex_results.get(sym, 'missing') if iex_request == 'ok' else iex_request
+                  for src, status in [('yahoo', ystate), ('massive', mstate), ('iex', istate)]:
+                      counts[src][status] += 1
+                  if sym in originally_missing and istate == 'fresh':
+                      rescued.append(sym)
+                  print(f'[source-diag] {sym} watch_missing={int(sym in originally_missing)} '
+                        f'yahoo={ystate} massive={mstate} iex={istate}')
+              def fmt(c):
+                  return ','.join(f'{k}:{c[k]}' for k in sorted(c)) or 'none'
+              print(f'[source-diag] summary n={len(symbols)} originally_missing={len(originally_missing & set(symbols))} '
+                    f'yahoo[{fmt(counts["yahoo"])}] massive[{fmt(counts["massive"])}] '
+                    f'iex[{fmt(counts["iex"])}] iex_fresh_on_missing={len(rescued)} '
+                    f'iex_status={iex_request} elapsed_s={time.time()-start:.1f}')
+
+
+          def schedule_source_diagnostic(symbols, missing, chart, massive, sessions, fresh, state_path):
+              """Non-blocking, no changes to /watch outcomes. Only sample 7 symbols / 30 min."""
+              if str(os.environ.get('FAISAL_SOURCE_DIAG', '1')).lower() in ('0', 'false', 'off'):
+                  return False
+              slot = int(time.time() // 1800)
+              if not _claim_slot(state_path, slot):
+                  return False
+              chosen, missing_set = _select_sample(symbols, missing, slot)
+              if not chosen:
+                  print('[source-diag] empty watchlist sample')
+                  return False
+              if not ((os.environ.get('APCA_API_KEY_ID') or os.environ.get('ALPACA_API_KEY_ID')) and
+                      (os.environ.get('APCA_API_SECRET_KEY') or os.environ.get('ALPACA_API_SECRET_KEY'))):
+                  print('[source-diag] disabled: add APCA_API_KEY_ID and APCA_API_SECRET_KEY in Render Environment')
+                  return False
+              worker = threading.Thread(
+                  target=_run_sample,
+                  args=(chosen, missing_set, chart, massive, sessions, fresh),
+                  daemon=True,
+                  name='faisal-source-diag',
+              )
+              worker.start()
+              return True
+          PY_SOURCE_DIAG
+          cat > /tmp/patch_source_diagnostics.py <<'PY_PATCH_DIAG'
+          from pathlib import Path
+          import ast
+
+          p = Path('app.py')
+          s = p.read_text(encoding='utf-8')
+          marker = 'FAISAL_ALPACA_SOURCE_DIAG_V1'
+          if marker in s:
+              print('Source diagnostic is already installed; no change.')
+          else:
+              anchors = [
+                  ('        found, keys, nodata, limited = {}, [], 0, 0',
+                   '        found, keys, nodata, limited = {}, [], 0, 0\n        diag_missing = []'),
+                  ('            if d is None:\n                nodata += 1; continue',
+                   '            if d is None:\n                nodata += 1\n                diag_missing.append(s)\n                continue'),
+              ]
+              for before, after in anchors:
+                  if s.count(before) != 1:
+                      raise SystemExit(f'Expected anchor occurs {s.count(before)} times: {before!r}; refusing patch')
+                  s = s.replace(before, after, 1)
+              # Inject only after completion of the original watch status logging, leaving
+              # the signal classification and Telegram-sending paths intact.
+              pos = '        print(f"[watch] فُحص {len(co)} · تنبيهات {len(msgs)} · بلا بيانات {nodata}")'
+              if s.count(pos) != 1:
+                  raise SystemExit('Expected /watch log line not found, refusing patch')
+              insertion = '''        # FAISAL_ALPACA_SOURCE_DIAG_V1 — silent background sampling; no signal changes.
+                  try:
+                      from source_diagnostics import schedule_source_diagnostic
+                      schedule_source_diagnostic(list(co), diag_missing, _chart,
+                                                 _massive_result, _sessions, _fresh, _state_path())
+                  except Exception as diag_exc:
+                      print(f"[source-diag] scheduling failed ({type(diag_exc).__name__}); /watch unaffected")
+          '''
+              s = s.replace(pos, pos+'\n'+insertion.rstrip(), 1)
+              ast.parse(s, filename='app.py')
+              p.write_text(s, encoding='utf-8')
+              print('Installed opt-in silent source diagnostics in app.py')
+          PY_PATCH_DIAG
+          python /tmp/patch_source_diagnostics.py
+      - name: Offline tests (no API calls)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q requests
+          python -m py_compile app.py source_diagnostics.py
+          cat > /tmp/test_source_diagnostics.py <<'PY_TEST_DIAG'
+          """Offline tests; no market data requests, no Telegram, no secrets."""
+          import os
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          import source_diagnostics as d
+
+          assert d._label_age('2026-11-11T14:00:00Z', now=1794405900) in ('stale', 'fresh')
+          assert d._label_age('invalid') == 'missing'
+          assert d._label_age(1000, now=1000 + 60 * 21) == 'stale'
+          assert d._label_age(1000, now=1000 + 60 * 5) == 'fresh'
+          assert d._label_age(None) == 'missing'
+
+          symbols=[f'S{i:03d}' for i in range(20)]
+          chosen, missing = d._select_sample(symbols, symbols[:12], 123, 5, 2)
+          assert len(chosen) == 7 and len(set(chosen)) == 7
+          assert sum(s in missing for s in chosen) == 5
+          assert set(d._select_sample(symbols, symbols[:12], 123,5,2)[0]) == set(chosen)
+          assert len(d._select_sample(symbols, [], 123, 5,2)[0]) == 2
+
+          with tempfile.TemporaryDirectory() as tmp:
+              path = str(Path(tmp) / 'state.json')
+              assert d._claim_slot(path, 100) is True
+              assert d._claim_slot(path, 100) is False
+              assert d._claim_slot(path, 101) is True
+
+          class MockResponse:
+              status_code=200
+              def json(self):
+                  return {'bars': {'S001': {'t': '2026-11-11T14:00:00Z'},
+                                   'S002': {'t': '2026-11-10T14:00:00Z'}}}
+
+          with patch.dict(os.environ, {'APCA_API_KEY_ID':'TEST-KEY',
+                                       'APCA_API_SECRET_KEY':'TEST-SECRET'}, clear=False):
+              with patch.object(d.requests, 'get', return_value=MockResponse()) as get:
+                  status, res = d._alpaca_latest(['S001','S002','S003'], now=1794406500)
+                  assert status=='ok' and res['S003']=='missing'
+                  call = get.call_args
+                  assert call.kwargs['params']['feed'] == 'iex'
+                  assert 'APCA_API_SECRET_KEY' not in call.kwargs.get('params',{})
+                  assert call.kwargs['headers']['APCA-API-KEY-ID'] == 'TEST-KEY'
+
+          class RateLimited:
+              status_code=429
+          with patch.dict(os.environ, {'APCA_API_KEY_ID':'TEST-KEY',
+                                       'APCA_API_SECRET_KEY':'TEST-SECRET'}, clear=False):
+              with patch.object(d.requests, 'get', return_value=RateLimited()):
+                  assert d._alpaca_latest(['S001'])[0]=='http_429'
+
+          # Caller can pass the exact existing watch freshness/aggregate helpers.
+          assert d._status_session(None, 'HTTP 429', lambda r:None, lambda s:False)=='429'
+          assert d._status_session(None, None, lambda r:None, lambda s:False)=='no_bars'
+          assert d._status_session({'timestamp':[1]}, None, lambda r:None, lambda s:False)=='invalid_sessions'
+          assert d._status_session({'timestamp':[1]}, None, lambda r:{'last_ts':10}, lambda s:True)=='fresh'
+
+          print('SOURCE_DIAGNOSTICS_TESTS_OK')
+          PY_TEST_DIAG
+          PYTHONPATH="$PWD" python /tmp/test_source_diagnostics.py
+          python - <<'PY_STATIC'
+          from pathlib import Path
+          import ast
+          source = Path('app.py').read_text(encoding='utf-8')
+          tree = ast.parse(source)
+          run = next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_watch_run_inner')
+          calls = [n for n in ast.walk(run) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='schedule_source_diagnostic']
+          assert len(calls)==1, f'Expected 1 observer call, found {len(calls)}'
+          assert source.count('FAISAL_ALPACA_SOURCE_DIAG_V1')==1
+          assert 'diag_missing.append(s)' in source
+          assert 'def _urgent' in source and 'def _watch_flush_due' in source
+          print('APP_INTEGRATION_OK: observer is called once; original watch preserved')
+          PY_STATIC
+          git diff --check
+          git diff --stat
+      - name: Save reviewed artifacts
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/faisal-alpaca-preview
+          git diff -- app.py > /tmp/faisal-alpaca-preview/app-change.patch || true
+          cp source_diagnostics.py /tmp/faisal-alpaca-preview/source_diagnostics.py 2>/dev/null || true
+          echo 'Preview only does not modify Render. Apply commits app.py and source_diagnostics.py to main.' > /tmp/faisal-alpaca-preview/README.txt
+      - name: Upload preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: faisal-silent-source-diagnostic-preview
+          path: /tmp/faisal-alpaca-preview/
+      - name: Apply only after successful validation
+        if: ${{ success() && inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'faisal-watch-bot'
+          git config user.email 'faisal-watch-bot@users.noreply.github.com'
+          git add -- app.py source_diagnostics.py
+          if git diff --cached --quiet; then
+            echo 'Already installed; no commit needed.'
+            exit 0
+          fi
+          git commit -m 'chore: add silent Alpaca IEX market-data diagnostics'
+          # No pull --rebase, no force push. A newer main causes a safe failure.
+          git push origin HEAD:main
+      - name: Preview is complete
+        if: ${{ success() && inputs.mode == 'preview' }}
+        run: echo 'Preview passed; no live files updated. Apply only after checking the review artifact.'
