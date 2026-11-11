@@ -1,5 +1,5 @@
 """
-Server — Yahoo Finance API Proxy (v1.18)
+Server — Yahoo Finance API Proxy (v1.19 — quiet notifications)
 - سقف تزامن 16 اتصال Yahoo في اللحظة (يمنع اختناق CPU و503)
 - كاش ذاكري: 60s اقتباسات / 300s شموع / 3600s إحصاءات شورت
 - /ping و /health لا يلمسان Yahoo أبداً (يردان فوراً تحت العاصفة)
@@ -40,7 +40,7 @@ import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-app = FastAPI(title="Faisal Proxy Server", version="1.18.0")
+app = FastAPI(title="Faisal Proxy Server", version="1.19.0")
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
@@ -522,15 +522,16 @@ def _n(x):
 
 RLM = "‏"                     # يبدأ به كل سطر ليُعرض من اليمين لليسار في تيليجرام ولو بدأ برمز لاتيني
 # v1.16: ترتيب الأحداث في رسالة الجولة — كل سطر يبدأ برمزه (لا عناوين)، والأهم أولاً
-WATCH_ORDER = ["take", "reclaim2", "reclaim", "down", "release_sw", "release", "up", "early", "zone", "short", "break", "alert"]
+WATCH_ORDER = ["down_stop", "take", "reclaim2", "reclaim", "down", "release_sw", "release", "up", "early", "zone", "short", "break", "alert"]
 _TIER_RANK = {"✅": 0, "👀": 1, "👁️": 2}
 
 
 def _urgent(k, rank):
-    """v1.17: ما يحتاج قراراً الآن يصل فوراً بصوت — 🛡️ هبوط على سهم عليه أمر، و🌀 و🎯 لـ✅ و👀. الباقي للملخص الصامت
-    v1.18: 💰 بلغ الهدف وأمرك نُفّذ · 🌀 استرداد بعد سحب الأمس (أي فئة — قرار فيصل) · 🔓 لـ✅ و👀، أو بعد سحب معلّق"""
-    return (k in ("down", "take", "reclaim2", "release_sw")
-            or (k in ("reclaim", "zone", "release") and rank <= 1))
+    """FAISAL_QUIET_V119: voice only for stop breach or ready setups.
+
+    A near/early watchlist is not a validated order and never receives voice.
+    """
+    return k == "down_stop" or (rank == 0 and k in ("zone", "reclaim"))
 
 
 def _watch_digest(found, title=None):
@@ -550,6 +551,46 @@ def _watch_digest(found, title=None):
     if len(cur) > 1:
         msgs.append("\n".join(cur))
     return msgs
+
+
+# FAISAL_QUIET_V119 — per-message delivery bookkeeping
+# Rows are (event_key, kind, tier_rank, symbol, line).
+def _deliver_watch_events(rows, title=None, silent=False):
+    if not rows:
+        return 0
+    priority = {kind: i for i, kind in enumerate(WATCH_ORDER)}
+    rows = sorted(rows, key=lambda x: (priority.get(x[1], 999), x[2], x[3]))
+    heading = f"{RLM}👁️ المراقب · {_riyadh(time.time())}" + (f" · {title}" if title else "")
+    chunks, group, size = [], [], len(heading) + 1
+    for row in rows:
+        line = f"{RLM}{row[4]}"
+        if group and size + len(line) + 2 > 3400:
+            chunks.append(group)
+            group, size = [], len(heading) + 1
+        group.append((row[0], line))
+        size += len(line) + 2
+    if group:
+        chunks.append(group)
+    delivered = 0
+    for group in chunks:
+        msg = heading + "\n" + "\n".join(line for _, line in group)
+        if "🧲" in msg and len(msg) + 42 < 4000:
+            msg += f"\n{RLM}🧲 = اندماج أو اتفاقية معلّقة"
+        if _tg(msg, silent=silent):
+            with _watch_lock:
+                for event_key, _ in group:
+                    _watch_sent[event_key] = 1
+                    _watch_buf.pop(event_key, None)
+            delivered += len(group)
+    return delivered
+
+
+def _queue_failed_urgent(rows):
+    """Keep failed voice alerts queued until accepted in a later /watch round."""
+    with _watch_lock:
+        for key, kind, rank, sym, line in rows:
+            if key not in _watch_sent:
+                _watch_buf[key] = (kind, rank, sym, line)
 
 
 def _at(arr, i):
@@ -573,7 +614,7 @@ def _sessions(result):
         c = float(c)
         ny = _ny_now(t)
         lo, hi = _at(q.get("low"), i), _at(q.get("high"), i)
-        bars.append({"d": ny.date(), "m": ny.hour * 60 + ny.minute, "c": c,
+        bars.append({"d": ny.date(), "t": int(t), "m": ny.hour * 60 + ny.minute, "c": c,
                      "l": float(lo if lo is not None else c), "h": max(float(hi), c) if hi is not None else c,
                      "v": float(_at(q.get("volume"), i) or 0)})
     reg = [b for b in bars if 570 <= b["m"] < 960]
@@ -600,7 +641,7 @@ def _sessions(result):
     a, z = PERIODS[session]
     seg = [b for b in day if a <= b["m"] < z] or [last]
     top = max(seg, key=lambda b: b["h"])                 # أعلى سعر في الفترة الحالية، ولو عاد السعر بعده
-    return {"session": session, "px": last["c"], "ref": ref, "chg": (last["c"] / ref - 1) * 100,
+    return {"session": session, "last_ts": last["t"], "px": last["c"], "ref": ref, "chg": (last["c"] / ref - 1) * 100,
             "low": min(b["l"] for b in day), "vol": sum(b["v"] for b in day), "date": str(today),
             "high": top["h"], "high_vol": top["v"],
             "day_low": min(b["l"] for b in day_all), "day_high": max(b["h"] for b in day_all)}
@@ -638,8 +679,14 @@ def _massive_result(sym):
 
 
 def _fresh(s):
-    """الملخص لليوم الحالي بنيويورك (لا صفقة الأمس متأخرة تُقرأ كأنها اليوم)"""
-    return bool(s) and s["date"] == str(_ny_now().date())
+    """Only trade on today's bars not older than 20 minutes (5m polling)."""
+    if not s or s.get("date") != str(_ny_now().date()):
+        return False
+    try:
+        age = time.time() - float(s["last_ts"])
+        return -60 <= age <= 20 * 60
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
 def _watch_one(sym, v):
@@ -663,8 +710,7 @@ def _watch_one(sym, v):
     day_hi = max(float(s.get("day_high") or 0), hi)                                 # v1.18: أعلى سعر في اليوم كله
     tg = [float(t) for t in (v.get("targets") or []) if t]
     # v1.18 (YYAI): أمر (أ) نُفّذ غالباً إن لمسه السعر اليوم أو في آخر 5 جلسات (يكتبه الرادار «touched»)
-    filled = (bool(entry) and (bool(v.get("touched")) or day_lo <= float(entry))
-              and not (stop and day_lo <= float(stop)))                     # ضرب الوقف اليوم ⇒ خرج المركز غالباً
+    entry_touched = bool(entry) and (bool(v.get("touched")) or day_lo <= float(entry))                     # ضرب الوقف اليوم ⇒ خرج المركز غالباً
     tier = (v.get("kinds") or [""])[0]
     icon = tier.split()[0] if tier.strip() else ""
     actionable = ("جاهز" in tier) or ("قريب" in tier)          # «جاهز» و«قريب» — عليهما أوامر في منطقة الاختبار
@@ -688,17 +734,22 @@ def _watch_one(sym, v):
     zn = v.get("zone") or []
     if (actionable and len(zn) == 2 and zn[0] and zn[1] and not lvl
             and zn[0] <= low <= zn[1] and px >= zn[0] and ref > zn[1]):
-        if entry:                                   # v1.18: أوامر (أ) في المنطقة — الدخول هو التنفيذ، لا انتظار تأكيد
-            hits.append(("zone", rank, f"🎯 {who} {_n(px)} · في منطقة أوامرك {_n(zn[0])}–{_n(zn[1])} · Limit {_n(entry)} "
-                                       + ("نُفّذ غالباً" if day_lo <= float(entry) else "قد يُنفَّذ")
-                                       + (f" · الوقف {_n(stop)}" if stop else "")))
+        if entry:
+            hits.append(("zone", rank, f"🎯 {who} {_n(px)} · اختبار منطقة {_n(zn[0])}–{_n(zn[1])}"
+                                       + f" · مستوى Limit {_n(entry)} (التنفيذ غير مؤكد)"
+                                       + (f" · وقف الخطة {_n(stop)}" if stop else "")))
         else:                                       # بلا أمر: التأكيد عند فيصل = إغلاق 4H فوق قمة شمعة الاختبار
             hits.append(("zone", rank, f"🎯 {who} {_n(px)} · يختبر المنطقة {_n(zn[0])}–{_n(zn[1])} · "
                                        "التأكيد: إغلاق 4H فوق قمة شمعة الاختبار"))
-    if entry and chg <= -WATCH["drop_pct"]:
-        hits.append(("down", rank, f"🛡️ {who} {_n(px)} ({pct}) · أمرك {_n(entry)}"
-                                   + (f" · ⛔ تحت الوقف {_n(stop)}" if stop and px <= stop else " · قد يُنفَّذ")
-                                   + " · راجع الخبر أو ألغِ"))
+    if entry and (chg <= -WATCH["drop_pct"] or (stop and px <= float(stop))):
+        breached_stop = bool(stop and px <= float(stop))
+        # A planned order is not a brokerage-confirmed position.
+        position_confirmed = v.get("position_confirmed") is True
+        kind = "down_stop" if breached_stop and position_confirmed else "down"
+        hits.append((kind, rank,
+                     f"🛡️ {who} {_n(px)} ({pct}) · مستوى دخول الخطة {_n(entry)}"
+                     + (f" · تجاوز وقف الخطة {_n(stop)} · تحقق من مركزك" if breached_stop else
+                        " · هبوط قوي، راجع خطتك (لا تأكيد على وجود أمر)")))
     # v1.15: 🚀 و⚡ على أعلى سعر في الفترة، لا آخر سعر فقط — القفزة التي تصعد وتعود بين فحصين لا تفوت
     # (SMTK بعد الإغلاق: 1.63 ثم 1.07 خلال دقائق، والفحص التالي رأى 1.07 فقط)
     hchg = (hi / ref - 1) * 100 if ref else chg
@@ -711,20 +762,20 @@ def _watch_one(sym, v):
                 + (f" بحجم {hv:,}" if hv else ""))
 
     # v1.18 (YYAI بعد الإغلاق +37%): بلغ الهدف الأول وأمرك نُفّذ غالباً ⇒ 💰 فوري بصوت، لا «لا تطارد» في ملخص صامت
-    took = bool(filled and tg and rank <= 1 and day_hi >= tg[0])
+    took = bool(entry and tg and rank <= 1 and day_hi >= tg[0])
     if took:
         got = [t for t in tg if day_hi >= t]
-        hits.append(("take", rank, f"💰 {who} {_n(px)} · بلغ " + ("أهداف البيع " if len(got) > 1 else "الهدف الأول ")
+        hits.append(("take", rank, f"💰 {who} {_n(px)} · لامس "
+                                   + ("مستويات الأهداف " if len(got) > 1 else "الهدف السعري ")
                                    + " · ".join(_n(t) for t in got)
-                                   + (f" (أعلى {_n(day_hi)})" if day_hi > got[-1] * 1.02 else "")
-                                   + f" · أمرك {_n(entry)} نُفّذ غالباً — بِع حسب الخطة"
-                                   + (f" · {per}: أمر Limit خارج الجلسة" if per != "الجلسة" else "")))
+                                   + f" (أعلى اليوم {_n(day_hi)}) · لا تأكيد لتنفيذ أي أمر من الوسيط"))
     if took:
         pass                                        # 💰 يغني عن 🚀 و⚡ للسهم نفسه
     elif hchg >= WATCH["up_pct"]:
         hits.append(("up", rank, f"🚀 {who} {_n(px)} ({pct} {per}){_spike(WATCH['up_pct'])}"
-                                 + (f" · أمرك {_n(entry)} نُفّذ غالباً · لا تزد" if filled else
-                                    (f" · أمرك {_n(entry)} لن يُنفَّذ" if entry and px > entry * 1.05 else "") + " · لا تطارد")))
+                                 + (" · لامس مستوى الدخول، التنفيذ غير مؤكد" if entry_touched else
+                                    (f" · السعر أعلى من مستوى Limit {_n(entry)}" if entry and px > float(entry) * 1.05 else ""))
+                                 + " · لا تطارد"))
         dkeys["up"] = f"up@{per}"
     elif hchg >= WATCH["up_early_pct"] and per != "الجلسة":
         hits.append(("early", rank, f"⚡ {who} {_n(px)} ({pct} {per}){_spike(WATCH['up_early_pct'])} · حجم {int(s['vol']):,}"
@@ -788,10 +839,30 @@ def _watch_run_inner():
             st["error"] = f"تعذّر قراءة القائمة: HTTP {r.status_code}" + (" (مستودع خاص؟ أضف GH_TOKEN)" if r.status_code == 404 and not tok else "")
             print(f"[watch] {st['error']}"); return
         data = r.json() if r.status_code == 200 else {}
+        raw_list_day = data.get("date") or data.get("asof")
+        if raw_list_day:
+            try:
+                day = datetime.fromisoformat(str(raw_list_day)[:10]).date()
+                days_old = (_ny_now().date() - day).days
+            except (TypeError, ValueError):
+                st["error"] = "invalid coiled date"
+                print(f"[watch] {st['error']}: {raw_list_day!r}")
+                return
+            if not 0 <= days_old <= 5:
+                st["error"] = f"stale coiled list: {raw_list_day} ({days_old} days old)"
+                print(f"[watch] {st['error']}")
+                return
+        else:
+            print("[watch] WARNING: coiled list has no date; source freshness unverified")
         co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
         co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
         futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
         found, keys, nodata, limited = {}, [], 0, 0
+        urgent_rows = []
+        with _watch_lock:
+            for event_key, value in _watch_buf.items():
+                if event_key[:10] == str(_ny_now().date()) and _urgent(value[0], value[1]):
+                    urgent_rows.append((event_key, *value))
         now_t = time.time()
         for s, f in futs.items():
             try:
@@ -812,14 +883,11 @@ def _watch_run_inner():
                         continue
                 found.setdefault(k, []).append((rank, s, line))
                 keys.append(key)
-        # v1.13: لا يُعلَّم التنبيه «مُرسلاً» إلا إذا قبله تيليجرام، فيُعاد في الجولة التالية
-        sent_ok = all([_tg(m) for m in _watch_digest(found)]) if keys else None
-        if sent_ok:
-            with _watch_lock:
-                if len(_watch_sent) > 5000:
-                    _watch_sent.clear()
-                for key in keys:
-                    _watch_sent[key] = 1
+                urgent_rows.append((key, k, rank, s, line))
+        # Mark each accepted event individually, even if another chunk fails.
+        delivered = _deliver_watch_events(urgent_rows) if urgent_rows else 0
+        _queue_failed_urgent(urgent_rows)
+        sent_ok = (delivered == len(urgent_rows)) if urgent_rows else None
         flushed = _watch_flush_due(now_t)
         msgs = keys
         # حماية عنوان الخادم: إن رفضت Yahoo كثيراً (429) نهدأ 15 دقيقة — الرادار يستخدم البروكسي نفسه
@@ -837,28 +905,40 @@ def _watch_run_inner():
 
 
 def _watch_flush_due(now_t=None):
-    """v1.17: الملخص الصامت — كل digest_min دقيقة إن وُجد ما ينتظر. يعيد عدد الأسطر المرسلة (0 إن لم يحن)"""
+    """Quiet digest: 09:25 NY (premarket) and 19:45 NY (end of extended session).
+
+    Keep scanning every 5 minutes; only notification cadence changes.
+    """
     now_t = now_t or time.time()
-    with _watch_lock:
-        newest = max((k[:10] for k in _watch_buf), default="")
-        for k in [k for k in _watch_buf if k[:10] < newest]:     # v1.18: سطر من يوم سابق بات في الانتظار ← لا يُرسل متأخراً
-            _watch_buf.pop(k, None)
-        items = dict(_watch_buf)
     ny = _ny_now(now_t)
-    closing = 19 * 60 + 45 <= ny.hour * 60 + ny.minute < 20 * 60   # v1.18: آخر جولات النافذة — لا يبيت الملخص إلى الغد
-    if not items or (now_t - _watch_flush["at"] < WATCH["digest_min"] * 60 and not closing):
+    minute = ny.hour * 60 + ny.minute
+    # Slot 1 tolerates a few minutes of scheduler delay; slot 2 ends at 20:00.
+    if 565 <= minute < 610:
+        slot, title = 565, "قبل الافتتاح"
+    elif 1185 <= minute < 1200:
+        slot, title = 1185, "ختام اليوم"
+    else:
         return 0
-    found = {}
-    for k, rank, s, line in items.values():
-        found.setdefault(k, []).append((rank, s, line))
-    if not all(_tg(m, silent=True) for m in _watch_digest(found, title=f"ملخص {WATCH['digest_min']:g} دقيقة")):
-        return 0                                    # يبقى في الانتظار ويُعاد في الجولة التالية
+    last_t = float(_watch_flush.get("at") or 0)
+    if last_t:
+        previous = _ny_now(last_t)
+        if previous.date() == ny.date() and previous.hour * 60 + previous.minute >= slot:
+            return 0
+    today = str(ny.date())
     with _watch_lock:
-        for key in items:
+        # Expire yesterday's unreported events rather than reporting them late.
+        for key in [k for k in _watch_buf if k[:10] != today]:
             _watch_buf.pop(key, None)
-            _watch_sent[key] = 1
-    _watch_flush["at"] = now_t
-    return len(items)
+        items = {key: value for key, value in _watch_buf.items()
+                 if not _urgent(value[0], value[1])}
+    if not items:
+        _watch_flush["at"] = now_t
+        return 0
+    rows = [(key, *value) for key, value in items.items()]
+    delivered = _deliver_watch_events(rows, title=title, silent=True)
+    if delivered == len(items):
+        _watch_flush["at"] = now_t
+    return delivered
 
 
 def _dm(d):
