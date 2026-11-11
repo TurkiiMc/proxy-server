@@ -33,8 +33,20 @@ def _edit(mutator, *, lock_nonblocking=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = str(path) + '.lock'
     with open(lock_path, 'a+', encoding='utf-8') as lock:
-        how = fcntl.LOCK_EX | (fcntl.LOCK_NB if lock_nonblocking else 0)
-        fcntl.flock(lock, how)
+        # FAISAL_MASSIVE_LOCK_RETRY_V2: brief contention is not an API failure.
+        # Wait no more than one second; never bypass the shared request budget.
+        if lock_nonblocking:
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             with path.open(encoding='utf-8') as handle:
                 state = json.load(handle)
@@ -57,10 +69,10 @@ def _edit(mutator, *, lock_nonblocking=False):
 
 
 def _reserve():
-    now = time.time()
     limit = _int_env('MASSIVE_MAX_REQUESTS_PER_MIN', 4, 1, 60)
 
     def update(state):
+        now = time.time()  # FAISAL_MASSIVE_RESERVATION_CLOCK_V2
         if now < float(state.get('cooldown_until') or 0):
             return '429_cooldown'
         events = state.get('requests', [])
