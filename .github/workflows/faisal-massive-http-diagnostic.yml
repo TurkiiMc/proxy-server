@@ -1,1 +1,242 @@
+name: Faisal - diagnose Massive HTTP and bar age
 
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run preview first; apply commits only if all tests pass'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: faisal-proxy-diagnostics-repair
+  cancel-in-progress: false
+
+jobs:
+  massive-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout proxy-server
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Guard repo and required helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TurkiiMc/proxy-server"
+          test "$GITHUB_REF_NAME" = "main"
+          test -f app.py
+          test -f source_diagnostics.py
+          grep -q 'FAISAL_ALPACA_SOURCE_DIAG_V1' source_diagnostics.py
+          echo 'Guard OK: updating diagnostic helper only. No app.py changes.'
+
+      - name: Patch helper in working tree for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/patch_massive_diag.py <<'PY_PATCH'
+          """Patch only FAISAL_ALPACA_SOURCE_DIAG_V1; fail closed if source does not match."""
+          from pathlib import Path
+          import ast
+          
+          p = Path('source_diagnostics.py')
+          if not p.is_file():
+              raise SystemExit('source_diagnostics.py missing: install previous silent diagnostic first')
+          s = p.read_text(encoding='utf-8')
+          if 'FAISAL_MASSIVE_HTTP_AGE_DIAG_V2' in s:
+              print('Massive HTTP+age diagnostic already present; no changes.')
+              raise SystemExit(0)
+          if 'FAISAL_ALPACA_SOURCE_DIAG_V1' not in s:
+              raise SystemExit('Unexpected helper version; refusing to modify it')
+          
+          def replace_once(before, after, desc):
+              global s
+              if s.count(before) != 1:
+                  raise SystemExit(f'Unexpected {desc} ({s.count(before)} matches); refusing patch')
+              s=s.replace(before,after,1)
+          
+          replace_once('from datetime import datetime, timezone\n',
+                       'from datetime import datetime, timezone, timedelta\nfrom zoneinfo import ZoneInfo\n',
+                       'datetime import')
+          
+          probe = '''# FAISAL_MASSIVE_HTTP_AGE_DIAG_V2: diagnostic-only Massive request.
+          # No changes to _massive_result used by live /watch, no Telegram, no key logging.
+          def _age_text(age):
+              return 'na' if age is None else f'{age:.1f}'
+          
+          
+          def _massive_probe(sym, now):
+              key = os.environ.get('MASSIVE_API_KEY')
+              if not key:
+                  return 'not_configured', None
+              try:
+                  day = datetime.fromtimestamp(now, ZoneInfo('America/New_York')).date()
+                  start_day = str(day - timedelta(days=5))
+                  # Mirror app.py original parameters; only the diagnostic result is logged.
+                  resp = requests.get(
+                      f'https://api.massive.com/v2/aggs/ticker/{sym.replace(".", "-")}/range/5/minute/{start_day}/{day}',
+                      params={'adjusted': 'true', 'sort': 'asc', 'limit': 5000, 'apiKey': key},
+                      timeout=12,
+                  )
+                  code = int(resp.status_code)
+                  if code != 200:
+                      return f'http_{code}', None
+                  data = resp.json()
+                  if not isinstance(data, dict):
+                      return 'http_200_invalid_json', None
+                  rows = data.get('results') or []
+                  if not isinstance(rows, list):
+                      return 'http_200_invalid_rows', None
+                  if not rows:
+                      return 'http_200_no_bars', None
+                  ts_ms = rows[-1].get('t') if isinstance(rows[-1], dict) else None
+                  age = _latest_age(float(ts_ms) / 1000 if ts_ms is not None else None, now)
+                  if age is None:
+                      return 'http_200_invalid_timestamp', None
+                  return f'http_200_{_label_age(float(ts_ms) / 1000, now)}', age
+              except requests.RequestException as exc:
+                  return f'network_{type(exc).__name__}', None
+              except Exception as exc:
+                  return f'parse_{type(exc).__name__}', None
+          
+          
+          '''
+          replace_once('def _run_sample(symbols, originally_missing, chart, massive, sessions, fresh):\n',
+                       probe+'def _run_sample(symbols, originally_missing, chart, massive, sessions, fresh):\n',
+                       'run sample header')
+          replace_once('    iex_request, iex_results = _alpaca_latest(symbols, now)\n',
+                       '    iex_request, iex_results, iex_ages = _alpaca_latest(symbols, now)\n',
+                       'iex unpack')
+          replace_once("        return 'missing_credentials', {}\n", "        return 'missing_credentials', {}, {}\n", 'alpaca missing key')
+          replace_once("            return f'http_{resp.status_code}', {}\n", "            return f'http_{resp.status_code}', {}, {}\n", 'alpaca status')
+          replace_once("            return 'bad_response', {}\n", "            return 'bad_response', {}, {}\n", 'alpaca invalid response')
+          replace_once("        return 'ok', {s: _label_age((bars.get(s) or {}).get('t'), now) for s in symbols}\n",
+                       "        return ('ok',\n                {s: _label_age((bars.get(s) or {}).get('t'), now) for s in symbols},\n                {s: _latest_age((bars.get(s) or {}).get('t'), now) for s in symbols})\n", 'alpaca success')
+          replace_once("        return f'network_{type(exc).__name__}', {}\n", "        return f'network_{type(exc).__name__}', {}, {}\n", 'alpaca exception')
+          
+          old = '''        if not os.environ.get('MASSIVE_API_KEY'):
+                      mstate = 'not_configured'
+                  else:
+                      try:
+                          m = massive(sym)
+                          mstate = _status_session(m, None, sessions, fresh)
+                      except Exception:
+                          mstate = 'exception'
+          '''
+          new = '''        # Separate read-only diagnostic probe: preserves original /watch Massive fallback.
+                  mstate, mage = _massive_probe(sym, now)
+          '''
+          replace_once(old,new,'Massive old branch')
+          replace_once("            ystate = _status_session(y, err, sessions, fresh)\n",
+                       "            ystate = _status_session(y, err, sessions, fresh)\n            yage = _latest_age((y.get('timestamp') or [None])[-1], now) if y else None\n",
+                       'Yahoo branch')
+          replace_once("        except Exception:\n            ystate = 'exception'\n",
+                       "        except Exception:\n            ystate, yage = 'exception', None\n",
+                       'Yahoo exception')
+          replace_once("              f'yahoo={ystate} massive={mstate} iex={istate}')\n",
+                       "              f'yahoo={ystate} yahoo_age_min={_age_text(yage)} '\n              f'massive={mstate} massive_age_min={_age_text(mage)} '\n              f'iex={istate} iex_age_min={_age_text(iex_ages.get(sym))}')\n",
+                       'diagnostic per-symbol log')
+          
+          ast.parse(s,filename='source_diagnostics.py')
+          p.write_text(s,encoding='utf-8')
+          print('Installed read-only Massive HTTP response status + last-bar age logs')
+          PY_PATCH
+          python /tmp/patch_massive_diag.py
+          python -m py_compile source_diagnostics.py app.py
+
+      - name: Offline diagnostic tests (no network)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/test_massive_diag.py <<'PY_TEST'
+          """Offline checks: HTTP status, no bars, last-bar age, and existing sample logs."""
+          import os
+          import io
+          import time
+          import contextlib
+          from unittest.mock import patch
+          import source_diagnostics as sd
+          
+          class MockResponse:
+              def __init__(self, status, data=None):
+                  self.status_code=status
+                  self._data=data if data is not None else {}
+              def json(self):
+                  return self._data
+          
+          now=time.time()
+          with patch.dict(os.environ, {'MASSIVE_API_KEY':'mock-not-real'}):
+              with patch.object(sd.requests,'get',return_value=MockResponse(403)) as get:
+                  state,age=sd._massive_probe('HKPD',now)
+                  assert (state,age)==('http_403',None)
+                  assert get.call_args.kwargs['params']['apiKey']=='mock-not-real'
+              with patch.object(sd.requests,'get',return_value=MockResponse(429)):
+                  assert sd._massive_probe('HKPD',now)[0]=='http_429'
+              with patch.object(sd.requests,'get',return_value=MockResponse(200,{'results':[]})):
+                  assert sd._massive_probe('HKPD',now)[0]=='http_200_no_bars'
+              recent=int((now-120)*1000)
+              with patch.object(sd.requests,'get',return_value=MockResponse(200,{'results':[{'t':recent}]})):
+                  state,age=sd._massive_probe('HKPD',now)
+                  assert state=='http_200_fresh' and 1.9<age<2.1, (state,age)
+              stale=int((now-3600)*1000)
+              with patch.object(sd.requests,'get',return_value=MockResponse(200,{'results':[{'t':stale}]})):
+                  state,age=sd._massive_probe('HKPD',now)
+                  assert state=='http_200_stale' and 59<age<61, (state,age)
+          with patch.dict(os.environ, {}, clear=True):
+              assert sd._massive_probe('HKPD',now)[0]=='not_configured'
+          
+          with patch.object(sd,'_alpaca_latest',return_value=('ok',{'HKPD':'stale'},{'HKPD':26.5})), \
+               patch.object(sd,'_massive_probe',return_value=('http_403',None)):
+              buf=io.StringIO()
+              with contextlib.redirect_stdout(buf):
+                  sd._run_sample(['HKPD'],{'HKPD'},lambda *args:(None,None),None,lambda res:None,lambda res:False)
+              output=buf.getvalue()
+              assert 'massive=http_403' in output and 'massive_age_min=na' in output and 'iex_age_min=26.5' in output,output
+              assert 'source-diag] summary' in output
+          print('OK: Massive 403, 429, 200 empty/fresh/stale, missing key, and intact IEX summary')
+          PY_TEST
+          PYTHONPATH="$PWD" python /tmp/test_massive_diag.py
+
+      - name: Save preview of exact change
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/massive-diagnostic-preview
+          git diff -- source_diagnostics.py > /tmp/massive-diagnostic-preview/source_diagnostics.patch
+          echo "Only source_diagnostics.py is modified. No live source priority or Telegram changes." > /tmp/massive-diagnostic-preview/README.txt
+
+      - name: Upload preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: massive-http-age-diagnostic-preview
+          path: /tmp/massive-diagnostic-preview/
+
+      - name: Apply tested helper only
+        if: ${{ success() && inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- source_diagnostics.py
+          if git diff --cached --quiet; then
+            echo 'Already installed: nothing to commit.'
+          else
+            git commit -m "diagnostics: log Massive HTTP status and bar ages"
+            # No pull/rebase, no force push. A concurrent update fails safely.
+            git push origin HEAD:main
+          fi
+
+      - name: Review complete without deployment
+        if: ${{ success() && inputs.mode == 'preview' }}
+        run: echo 'Preview passed. No files pushed; run apply only if you approve.'
