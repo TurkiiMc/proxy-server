@@ -826,6 +826,30 @@ def _watch_run():
                 print(f"[watch] تعذّر حفظ الذاكرة المشتركة: {e}")
 
 
+# FAISAL_WATCH_ROTATE_V1 — watch ready/near every round; rotate early-only coverage.
+# This is a coverage/scheduling change only. Trading criteria and alert urgency are unchanged.
+def _select_watch_symbols(watch, cap, epoch_slot):
+    def tier(item):
+        kinds = item[1].get('kinds') or []
+        desc = str(kinds[0]) if kinds else ''
+        return 0 if 'جاهز' in desc else (1 if 'قريب' in desc else 2)
+
+    ranked = sorted(watch.items(), key=lambda item: (tier(item),
+        -float(item[1].get('score') or 0), item[0]))
+    core = [item for item in ranked if tier(item) <= 1]
+    early = [item for item in ranked if tier(item) > 1]
+    if len(core) >= cap:
+        return dict(core[:cap])
+    slots = cap - len(core)
+    if len(early) <= slots:
+        return dict(core + early)
+    # Consecutive polling slots walk the whole early pool without relying on
+    # persistent memory (works across two Render worker processes).
+    offset = (int(epoch_slot) * slots) % len(early)
+    chosen = [early[(offset + j) % len(early)] for j in range(slots)]
+    return dict(core + chosen)
+
+
 def _watch_run_inner():
     st = _watch_last
     try:
@@ -855,7 +879,7 @@ def _watch_run_inner():
         else:
             print("[watch] WARNING: coiled list has no date; source freshness unverified")
         co = {k: v for k, v in (data.get("list") or {}).items() if isinstance(v, dict)}
-        co = dict(sorted(co.items(), key=lambda kv: (not kv[1].get("entry"), kv[0]))[:WATCH["max_symbols"]])
+        co = _select_watch_symbols(co, WATCH["max_symbols"], int(time.time() // 300))
         futs = {s: exec_pool.submit(_watch_one, s, v) for s, v in co.items()}
         found, keys, nodata, limited = {}, [], 0, 0
         urgent_rows = []
